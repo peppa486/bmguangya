@@ -1,0 +1,56 @@
+{
+  "dry_run": true,
+  "state_path": "/opt/anime-stack/state/bangumi-sync-state.json",
+  "catalog_path": "/opt/anime-stack/state/bangumi-collections-catalog.json",
+  "tracked_collection_types": [1, 2, 3],
+  "download_collection_types": [3],
+  "bangumi": {
+    "base_url": "https://api.bgm.tv",
+    "username": "your_bangumi_username",
+    "access_token": "",
+    "user_agent": "anime-sync/0.1 (contact: you@example.com)"
+  },
+  "mikan": {
+    "base_url": "https://mikanani.me",
+    "user_agent": "anime-sync/0.1",
+    "max_candidates_per_show": 6
+  },
+  "filters": {
+    "preferred_subgroups": [
+      "北宇治字幕组",
+      "喵萌奶茶屋",
+      "LoliHouse",
+      "桜都字幕组",
+      "悠哈璃羽字幕社"
+    ],
+    "require_keywords_any": [
+      "简",
+      "CHS",
+      "GB",
+      "简体",
+      "简中"
+    ],
+    "exclude_keywords": [
+      "BIG5",
+      "粤语",
+      "外挂"
+    ],
+    "prefer_resolutions": [
+      "1080p",
+      "2160p",
+      "720p"
+    ]
+  },
+  "qbittorrent": {
+    "base_url": "http://127.0.0.1:8080",
+    "username": "admin",
+    "password": "",
+    "category": "anime",
+    "savepath": "/downloads/complete/anime",
+    "paused": false,
+    "tags": [
+      "bangumi",
+      "mikan"
+    ]
+  }
+}
