@@ -108,8 +108,10 @@ def detect_season_index(*texts: str) -> int:
 
 
 def normalize_bangumi_display_name(display_name: str) -> str:
-    title = normalize_series_title(display_name or '')
-    return sanitize_component(title or display_name)
+    # Preserve the exact Bangumi display name because it often already encodes
+    # season/part/movie distinctions (e.g. 第三季, 第2期, 前篇). Stripping those
+    # makes different subjects collide in the same GuangYa folder.
+    return sanitize_component(display_name or '')
 
 
 def build_subject_path(display_name: str, collection_type: int) -> Tuple[str, str]:
@@ -118,14 +120,36 @@ def build_subject_path(display_name: str, collection_type: int) -> Tuple[str, st
     return sanitize_component(category_dir), show_dir
 
 
+def extract_special_label(*texts: str) -> str:
+    joined = " ".join(t or "" for t in texts)
+    upper = joined.upper()
+    for token in ("NCOP", "NCED"):
+        match = re.search(rf"(?<![A-Z0-9]){token}\s*([0-9]{{1,2}})?(?![A-Z0-9])", upper)
+        if match:
+            num = match.group(1)
+            return f"{token}{int(num):02d}" if num else token
+    for token in ("SP", "OVA", "OAD"):
+        match = re.search(rf"(?<![A-Z0-9]){token}\s*[-_ ]?([0-9]{{1,2}})?(?![A-Z0-9])", upper)
+        if match:
+            num = match.group(1)
+            return f"{token}{int(num or 1):02d}"
+    return ""
+
+
 def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
-    """Extract episode label for filename.
+    """Extract episode/special label for filename.
 
     Returns:
       - "01" for single episode
-      - "01-12" for episode range (collection pack)
-      - None if no episode info found
+      - "SP01" / "OVA01" / "OAD01" for specials
+      - "NCOP" / "NCED" for creditless OP/ED
+      - "01-12" for episode range (filtered before submission)
+      - "" if no episode info found
     """
+    special = extract_special_label(source_title, resolved_file_name)
+    if special:
+        return special
+
     # Try range first (e.g., [01-12])
     span = extract_episode_span(source_title)
     if span:
@@ -155,6 +179,38 @@ def build_target_names(display_name: str, source_title: str, resolved_file_name:
         # Movie/OVA/single file with no episode number → use "01" as default
         filename = f"01{suffix}"
     return folder, filename
+
+
+def is_single_episode_candidate(title: str) -> bool:
+    """Return True only for resources that should create one playable file.
+
+    GuangYa offline-download cannot split batch torrents for us. Reject multi-episode
+    ranges and explicit batch/complete-pack releases so they do not become
+    ``01-12.mkv`` folders/files beside normal episodes. Movie/OVA titles with no
+    parsed episode number are still allowed unless they contain batch keywords.
+    """
+    lower = (title or "").lower()
+    if any(keyword in lower for keyword in [
+        "合集", "全集", "全话", "全卷", "batch", "complete", "complete batch",
+        "season batch", "vol.", "box",
+    ]):
+        return False
+    span = extract_episode_span(title or "")
+    if span and span[0] != span[1]:
+        return False
+    return True
+
+
+def build_existing_target_index(state: dict) -> set:
+    index = set()
+    for task in (state.get("cloud_tasks") or {}).values():
+        if not isinstance(task, dict):
+            continue
+        target_dir = (task.get("target_dir") or "").strip("/")
+        target_name = (task.get("target_name") or "").strip("/")
+        if target_dir and target_name:
+            index.add(f"{target_dir}/{target_name}")
+    return index
 
 
 def plan_subject_sync_actions(tracked_subjects: Dict[str, dict], subject_locations: Dict[str, dict], removed_subject_ids: List[str]) -> List[dict]:
@@ -399,11 +455,16 @@ def pick_best_per_episode(
         ok, sc, reasons = score_item(item["title"], filters, locked_subgroup=locked_subgroup)
         if not ok:
             continue
+        if not is_single_episode_candidate(item["title"]):
+            continue
 
         # Determine episode key
+        special_key = extract_special_label(item["title"])
         ep = parse_episode_number(item["title"])
         span = extract_episode_span(item["title"])
-        if span:
+        if special_key:
+            ep_key = f"special-{special_key}"
+        elif span:
             start, end = span
             if start == end:
                 ep_key = f"ep-{start:03d}"
@@ -446,6 +507,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     state.setdefault("cloud_tasks", {})
     state.setdefault("subject_locations", {})
     seen = set(state["seen_guids"])
+    existing_targets = build_existing_target_index(state)
 
     bangumi = BangumiClient(cfg["bangumi"])
     mikan = MikanClient(cfg.get("mikan", {}))
@@ -497,6 +559,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     submitted: List[dict] = []
     unresolved: List[dict] = []
     skipped_watched: List[dict] = []
+    skipped_existing_targets: List[dict] = []
     dedup_stats = {"total_rss_items": 0, "after_dedup": 0, "subjects_processed": 0}
     quota_exhausted = False
 
@@ -586,6 +649,19 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 folder_id = ensure_child_dir(client, category_id, show_dir)
                 magnet = f"magnet:?xt=urn:btih:{info_hash}"
                 payload = build_create_task_payload(magnet, folder_id, file_name)
+
+            target_key = f"{category_dir}/{show_dir}/{file_name}"
+            if target_key in existing_targets:
+                logger.info("Skip duplicate target path: %s :: %s", target_key, item["title"])
+                skipped_existing_targets.append({
+                    "subject_id": subject_id,
+                    "show": display,
+                    "title": item["title"],
+                    "target": target_key,
+                })
+                continue
+
+            if not dry_run:
                 task = create_cloud_task(client, payload)
                 task_id = ((task.get("data") or {}).get("taskId"))
                 if not task_id:
@@ -606,6 +682,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                     task_id,
                 )
 
+            existing_targets.add(target_key)
             seen.add(guid)
             state["seen_guids"].append(guid)
             matched_subgroup = item.get("matched_subgroup")
@@ -661,6 +738,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         "submitted_count": len(submitted),
         "unresolved_count": len(unresolved),
         "skipped_watched_count": len(skipped_watched),
+        "skipped_existing_target_count": len(skipped_existing_targets),
         "dry_run": dry_run,
         "tracked_count": len(collections),
         "tracked_type_counts": type_counts,
@@ -671,6 +749,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         "submitted": submitted,
         "unresolved": unresolved,
         "skipped_watched": skipped_watched[:20],
+        "skipped_existing_targets": skipped_existing_targets[:20],
     }
 
 
