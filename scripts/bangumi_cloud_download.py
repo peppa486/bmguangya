@@ -26,8 +26,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import requests
 
-sys.path.insert(0, "/opt/anime-stack/scripts")
-sys.path.insert(0, "/opt/guangya-webdav")
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(1, "/opt/anime-stack/scripts")
+sys.path.insert(2, "/opt/guangya-webdav")
 
 if TYPE_CHECKING:
     from app.guangya_client import GuangYaClient  # type: ignore
@@ -150,6 +152,32 @@ def extract_chinese_episode_number(*texts: str) -> Optional[int]:
     return None
 
 
+def extract_strict_episode_number(*texts: str) -> Optional[int]:
+    """Extract the actual episode number without confusing season/resolution.
+
+    Avoid old false positives like S01E06 -> 01 or 1080p -> 108.
+    Handles common Mikan forms: S01E06, 第06话, [06v2], - 06, 【06】.
+    """
+    patterns = [
+        r"\bS\d{1,2}E(\d{1,3})(?:v\d+)?\b",
+        r"第\s*(\d{1,3})\s*[话話集]",
+        r"[\[【(（]\s*(\d{1,3})(?:v\d+)?\s*[\]】)）]",
+        r"(?:^|[\s_\-])(?:EP|E)\s*(\d{1,3})(?:v\d+)?(?:\b|[^0-9])",
+        r"\s-\s*(\d{1,3})(?:v\d+)?(?:\s|\[|【|$)",
+    ]
+    for text in texts:
+        if not text:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.I)
+            if not match:
+                continue
+            ep = int(match.group(1))
+            if 0 < ep < 200:
+                return ep
+    return None
+
+
 def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
     """Extract episode/special label for filename.
 
@@ -164,7 +192,12 @@ def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
     if special:
         return special
 
-    # Try range first (e.g., [01-12])
+    # Prefer strict single-episode patterns before generic span parsing, because
+    # old parsers may read S01E06 as episode 01.
+    ep = extract_strict_episode_number(source_title, resolved_file_name)
+    if ep is not None:
+        return f"{ep:02d}"
+
     span = extract_episode_span(source_title)
     if span:
         start, end = span
@@ -172,14 +205,9 @@ def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
             return f"{start:02d}"
         return f"{start:02d}-{end:02d}"
 
-    # Try single episode number
-    ep = (
-        parse_episode_number(source_title)
-        or parse_episode_number(resolved_file_name)
-        or extract_chinese_episode_number(source_title, resolved_file_name)
-    )
-    if ep is not None:
-        return f"{ep:02d}"
+    ep = parse_episode_number(source_title) or parse_episode_number(resolved_file_name)
+    if ep is not None and 0 < int(ep) < 200:
+        return f"{int(ep):02d}"
 
     return ""
 
@@ -209,9 +237,11 @@ def is_single_episode_candidate(title: str) -> bool:
     """
     text = title or ""
     lower = text.lower()
+    # More aggressive keyword filtering for collections/bundles
     if any(keyword in lower for keyword in [
-        "合集", "全集", "全话", "全卷", "batch", "complete", "complete batch",
-        "season batch", "vol.", "box",
+        "合集", "全集", "全话", "全卷", "全季", "整季", "打包",
+        "batch", "complete", "complete batch", "season batch",
+        "vol.", "box", "pack",
     ]):
         return False
 
@@ -221,7 +251,8 @@ def is_single_episode_candidate(title: str) -> bool:
     explicit_range_patterns = [
         r"第\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*[话話集]",
         r"[\[【(（]\s*(?:第\s*)?\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:[话話集])?\s*[\]】)）]",
-        r"(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}",
+        r"\b(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\b",
+        r"\d{1,3}-\d{1,3}\s*(?:话|集|ep)",
     ]
     for pattern in explicit_range_patterns:
         match = re.search(pattern, text, flags=re.I)
@@ -470,6 +501,24 @@ def should_skip_watched(row: dict, item: dict) -> bool:
     return end_ep <= watched_ep
 
 
+def extract_release_version(*texts: str) -> int:
+    """Extract release revision like v2/v3 from torrent titles.
+
+    No explicit vN means version 1. This lets v2 replace v1 for the same
+    episode instead of downloading both.
+    """
+    max_version = 1
+    for text in texts:
+        if not text:
+            continue
+        for match in re.finditer(r"(?<![A-Za-z0-9])v\s*(\d{1,2})(?![A-Za-z0-9])", text, flags=re.I):
+            max_version = max(max_version, int(match.group(1)))
+        # Common compact forms in episode labels: 05v2, [05v2]
+        for match in re.finditer(r"(?<!\d)\d{1,3}\s*v\s*(\d{1,2})(?![A-Za-z0-9])", text, flags=re.I):
+            max_version = max(max_version, int(match.group(1)))
+    return max_version
+
+
 def pick_best_per_episode(
     rss_items: List[dict],
     filters: dict,
@@ -481,7 +530,8 @@ def pick_best_per_episode(
     this function:
     1. Scores all items with the locked subgroup
     2. Groups by episode key
-    3. Returns only the highest-scoring item per episode
+    3. Returns only one item per episode
+    4. If an episode has v2/v3, chooses the highest release version and rejects v1
 
     If locked_subgroup produces no results, falls back to no lock.
     """
@@ -494,12 +544,16 @@ def pick_best_per_episode(
         if not is_single_episode_candidate(item["title"]):
             continue
 
-        # Determine episode key
+        # Determine episode key with the same strict rules used for final
+        # filenames. This prevents S01E06 and 06v2 from being grouped as ep-001.
         special_key = extract_special_label(item["title"])
-        ep = parse_episode_number(item["title"])
+        strict_ep = extract_strict_episode_number(item["title"])
         span = extract_episode_span(item["title"])
+        ep = parse_episode_number(item["title"])
         if special_key:
             ep_key = f"special-{special_key}"
+        elif strict_ep is not None:
+            ep_key = f"ep-{strict_ep:03d}"
         elif span:
             start, end = span
             if start == end:
@@ -507,19 +561,27 @@ def pick_best_per_episode(
             else:
                 ep_key = f"range-{start:03d}-{end:03d}"
         elif ep is not None:
-            ep_key = f"ep-{ep:03d}"
+            ep_key = f"ep-{int(ep):03d}"
         else:
             # Movie/OVA/single file — use a generic key so only ONE is kept
             ep_key = "single"
 
         cand = dict(item)
         cand["score"] = sc
+        cand["release_version"] = extract_release_version(item["title"])
         cand["reasons"] = reasons
         cand["matched_subgroup"] = extract_subgroup(item["title"], filters)
         cand["episode_key"] = ep_key
 
         prev = grouped.get(ep_key)
-        if prev is None or cand["score"] > prev["score"]:
+        if prev is None:
+            grouped[ep_key] = cand
+            continue
+        # Highest release revision wins first: v2/v3 replaces v1 for the same
+        # episode. Only compare score when release version is equal.
+        if cand["release_version"] > int(prev.get("release_version") or 1):
+            grouped[ep_key] = cand
+        elif cand["release_version"] == int(prev.get("release_version") or 1) and cand["score"] > prev["score"]:
             grouped[ep_key] = cand
 
     # If locked subgroup yielded nothing, retry without lock
@@ -548,8 +610,20 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     bangumi = BangumiClient(cfg["bangumi"])
     mikan = MikanClient(cfg.get("mikan", {}))
     tracked_collection_types = [int(x) for x in cfg.get("tracked_collection_types", [1, 2, 3])]
-    download_collection_types = set(int(x) for x in cfg.get("download_collection_types", [1, 2, 3]))
+    download_collection_type_order = [int(x) for x in cfg.get("download_collection_types", [3, 1, 2])]
+    download_collection_types = set(download_collection_type_order)
     collections = bangumi.get_combined_anime_collections(tracked_collection_types)
+    # Priority download order matters: e.g. [3, 1, 2] means spend the daily
+    # quota on Bangumi "doing" first, then wish/collect only if quota remains.
+    priority_rank = {ctype: idx for idx, ctype in enumerate(download_collection_type_order)}
+    collections = sorted(
+        collections,
+        key=lambda row: (
+            priority_rank.get(int(row.get("collection_type") or row.get("type") or 0), 999),
+            str(row.get("updated_at") or ""),
+            str(row.get("subject_id") or ((row.get("subject") or {}).get("id")) or ""),
+        ),
+    )
 
     type_counts: Dict[str, int] = {}
     for row in collections:
@@ -779,7 +853,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         "tracked_count": len(collections),
         "tracked_type_counts": type_counts,
         "removed_subject_ids": removed_subject_ids,
-        "download_collection_types": sorted(download_collection_types),
+        "download_collection_types": download_collection_type_order,
         "sync_actions": applied_sync_actions,
         "dedup_stats": dedup_stats,
         "submitted": submitted,

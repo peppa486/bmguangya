@@ -38,10 +38,15 @@ def main() -> int:
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(OUT)
     RAW.unlink(missing_ok=True)
+    # This script runs bangumi_cloud_download.py in --dry-run mode to build a
+    # dashboard/cache plan. Do not call these real submissions; that previously
+    # made logs look like 200 tasks had been submitted even when GuangYa quota was
+    # exhausted before the real run created anything.
     print(json.dumps({
-        'submitted_count': data.get('submitted_count', 0),
+        'planned_count': data.get('submitted_count', 0),
         'unresolved_count': data.get('unresolved_count', 0),
         'tracked_count': data.get('tracked_count', 0),
+        'dry_run': True,
     }, ensure_ascii=False))
     return 0
 

@@ -9,8 +9,9 @@ import unittest
 
 sys.modules.setdefault('oss2', types.SimpleNamespace())
 
+SCRIPT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts', 'bangumi_cloud_download.py'))
 spec = importlib.util.spec_from_file_location(
-    'bangumi_cloud_download', '/opt/anime-stack/scripts/bangumi_cloud_download.py'
+    'bangumi_cloud_download', SCRIPT_PATH
 )
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
@@ -162,6 +163,38 @@ class BangumiCloudDownloadSelectionTests(unittest.TestCase):
         self.assertFalse(mod.is_single_episode_candidate('【恶魔岛字幕组】★4月新番【宇宙兄弟_Uchuu Kyoudai】【第01-99话】[GB][720P][MP4][全]'))
         self.assertFalse(mod.is_single_episode_candidate('Test Show Complete Batch 01-12'))
         self.assertTrue(mod.is_single_episode_candidate('Movie Title BDRip 1080p'))
+
+
+    def test_extract_episode_label_handles_season_episode_without_s01_false_positive(self):
+        _, filename = mod.build_target_names(
+            display_name='间谍过家家 第三季',
+            source_title='[NEST] 间谍过家家 第三季 S01E06 [CR WEB-DL 1080p AVC AAC][简日内封]',
+            resolved_file_name='source.mkv',
+        )
+        self.assertEqual(filename, '06.mkv')
+
+    def test_pick_best_per_episode_prefers_highest_v_revision(self):
+        items = [
+            {
+                'guid': 'v1',
+                'title': '[字幕组] 测试番 - 05 [1080p][简中]',
+                'torrent_url': 'https://example.com/05.torrent',
+            },
+            {
+                'guid': 'v2',
+                'title': '[字幕组] 测试番 - 05v2 [1080p][简中]',
+                'torrent_url': 'https://example.com/05v2.torrent',
+            },
+        ]
+        chosen = mod.pick_best_per_episode(
+            items,
+            {'require_keywords_any': ['简中'], 'exclude_keywords': []},
+            locked_subgroup=None,
+        )
+        self.assertEqual(len(chosen), 1)
+        self.assertEqual(chosen[0]['guid'], 'v2')
+        self.assertEqual(chosen[0]['episode_key'], 'ep-005')
+        self.assertEqual(chosen[0]['release_version'], 2)
 
 
 class BangumiCloudDownloadDryRunTests(unittest.TestCase):

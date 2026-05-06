@@ -7,7 +7,8 @@
 - 📺 **以 Bangumi 为主数据源** — 直接读取你的「想看 / 在看 / 看过」收藏状态，无需额外维护列表
 - 🔍 **自动 Mikan 匹配** — 对每部番自动搜索 Mikan，拉取 RSS 解析种子
 - 🎯 **智能选种过滤** — 按字幕组优先级偏好、简体/繁体过滤、分辨率偏好自动选择最优版本
-- ✂️ **单集去重** — 每一集只保留一个最优版本，避免同一集下载多个不同字幕组/分辨率版本
+- ✂️ **单集去重** — 每一集只保留一个最优版本，避免同一集下载多个不同字幕组/分辨率版本；若同集存在 `v2/v3`，优先选择最高修正版，不下载旧版
+- ⏫ **收藏状态优先级** — `download_collection_types` 的顺序会决定配额消耗顺序，例如 `[3, 1, 2]` 表示先下载「在看」，额度有剩再下载「想看 / 看过」
 - 🧹 **干净命名** — 按 Bangumi 原名整理目录结构，文件名只保留纯集号 (`01.mkv`, `02.mp4`)，去除发布组噪音
 - 📁 **按收藏状态分类** — `想看/` `在看/` `看过/` 自动分类，Bangumi 状态变更时自动移动目录
 - 🗑️ **删除联动** — Bangumi 删除条目时自动删除 GuangYa 对应目录
@@ -55,7 +56,10 @@ Anime/
 
 - 一级目录：Bangumi 收藏状态分类
 - 二级目录：直接使用 Bangumi 显示名（天然区分季/部/Part）
-- 文件名：纯集数，保留原扩展名 → `01.mkv`, `01-12.mkv`（合集）
+- 文件名：纯集数，保留原扩展名 → `01.mkv`, `02.mp4`
+- 特殊集：`SP01.mkv`, `OVA01.mkv`, `OAD01.mkv`, `NCOP.mkv`, `NCED.mkv`
+- 合集 / 全集 / 全季 / batch / pack / `01-12` 这类资源默认拒绝，避免产生重复剧集或不可控打包文件
+- 选种版本号（例如 `05v2`）只用于选择资源；落盘仍命名为 `05.mkv`，不把 `v2` 写进文件名
 
 ## 快速开始
 
@@ -69,8 +73,8 @@ Anime/
 ### 2. 克隆项目
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/bangumi-mikan-guangya-automation.git
-cd bangumi-mikan-guangya-automation
+git clone https://github.com/peppa486/bmguangya.git
+cd bmguangya
 ```
 
 ### 3. 复制并编辑配置
@@ -87,8 +91,8 @@ nano config/bangumi-sync.json
 |--------|------|
 | `dry_run` | `true` 为试运行，不真实提交任务；测试没问题后改 `false` |
 | `tracked_collection_types` | 跟踪哪些 Bangumi 收藏类型，默认 `[1, 2, 3]` = 想看/看过/在看 |
-| `download_collection_types` | 对哪些类型执行下载，默认 `[3]` = 只下载「在看」 |
-| `max_new_cloud_tasks_per_run` | 单次运行最多提交多少新任务，`0` 表示不限；首次迁移建议限流 |
+| `download_collection_types` | 对哪些类型执行下载，并按顺序消耗配额；推荐 `[3, 1, 2]` = 优先「在看」，然后「想看」，最后「看过」 |
+| `max_new_cloud_tasks_per_run` | 单次运行最多提交多少新任务，`0` 表示不限；示例配置为 `200`，不要超过光鸭实际日配额 |
 | `bangumi.username` | 你的 Bangumi 用户名 |
 | `bangumi.access_token` | 你的 Bangumi 开发者 access_token |
 | `filters.preferred_subgroups` | 字幕组优先级排序，排在前面优先选 |
@@ -115,11 +119,22 @@ python scripts/bangumi_cloud_download.py --config config/bangumi-sync.json --dry
 
 ### 6. 定时同步
 
-推荐用 systemd timer 或 cron 每小时或每 30 分钟自动同步：
+推荐用 systemd timer 或 cron 定时同步。若使用光鸭每日离线添加配额，建议每天北京时间 00:10 以后运行一次，让配额按自然日重置后继续上次 state 进度：
+
+```bash
+sudo cp systemd/bangumi-mikan-sync.service /etc/systemd/system/
+sudo cp systemd/bangumi-mikan-sync.timer /etc/systemd/system/
+sudo timedatectl set-timezone Asia/Shanghai
+sudo systemctl daemon-reload
+sudo systemctl enable --now bangumi-mikan-sync.timer
+systemctl list-timers --all bangumi-mikan-sync.timer --no-pager
+```
+
+cron 示例：
 
 ```cron
-# 示例：每小时同步一次（北京时间）
-0 * * * * /opt/guangya-webdav/venv/bin/python /path/to/bangumi-mikan-guangya-automation/scripts/bangumi_cloud_download.py --config /path/to/config/bangumi-sync.json >> /path/to/state/sync.log 2>&1
+# 示例：每天 00:10 同步一次（请确保系统时区为 Asia/Shanghai）
+10 0 * * * /opt/guangya-webdav/venv/bin/python /path/to/bangumi-mikan-guangya-automation/scripts/bangumi_cloud_download.py --config /path/to/config/bangumi-sync.json >> /path/to/state/sync.log 2>&1
 ```
 
 ## 默认字幕组优先级
@@ -128,9 +143,9 @@ python scripts/bangumi_cloud_download.py --config config/bangumi-sync.json --dry
 
 ```json
 [
-  "北宇治字幕组", "喵萌奶茶屋", "LoliHouse", "千夏字幕组",
+  "喵萌奶茶屋&LoliHouse", "喵萌奶茶屋", "LoliHouse", "千夏字幕组",
   "桜都字幕组", "SweetSub", "澄空学园&动漫国字幕组", "雪飘工作室",
-  "豌豆字幕组", "幻樱字幕组", "风之圣殿", "北宇治字幕组",
+  "豌豆字幕组", "幻樱字幕组", "风之圣殿字幕组", "北宇治字幕组",
   "悠哈璃羽字幕社", "霜庭云花Sub", "绿茶字幕组", "ANi",
   "Nekomoe kissaten", "Lilith-Raws", "Skymoon-Raws"
 ]
@@ -151,7 +166,11 @@ python scripts/bangumi_cloud_download.py --config config/bangumi-sync.json --dry
 
 ## 关于光鸭配额
 
-光鸭云盘免费用户每日离线添加任务有配额限制（大约数百个/天）。本脚本检测到配额用尽（错误码 354）后会立即停止提交，等待次日自然恢复后继续。
+光鸭云盘每日离线添加任务有配额限制，不同会员等级额度不同。示例配置用 `max_new_cloud_tasks_per_run: 200` 作为保守值；如果你的账号日配额更高，可以自行调大，但建议不要超过实际日配额。
+
+本脚本检测到配额用尽（错误码 `354`）后会立即停止提交，等待次日自然日恢复后继续。注意：删除光鸭云盘文件或删除云添加任务通常**不会返还当天已消耗的云添加次数**。
+
+`scripts/generate_guangya_plan_cache.py` 只运行 dry-run 生成计划缓存，输出字段为 `planned_count`，不代表真实提交数。真实提交请看主脚本输出中的 `dry_run=false` 和 `submitted_count`，或 state 中的 `cloud_tasks`。
 
 ## 许可证
 

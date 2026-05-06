@@ -8,8 +8,11 @@
     3
   ],
   "download_collection_types": [
-    3
+    3,
+    1,
+    2
   ],
+  "max_new_cloud_tasks_per_run": 200,
   "bangumi": {
     "base_url": "https://api.bgm.tv",
     "username": "your_bangumi_username",
@@ -23,11 +26,25 @@
   },
   "filters": {
     "preferred_subgroups": [
-      "北宇治字幕组",
+      "喵萌奶茶屋&LoliHouse",
       "喵萌奶茶屋",
       "LoliHouse",
+      "千夏字幕组",
       "桜都字幕组",
-      "悠哈璃羽字幕社"
+      "SweetSub",
+      "澄空学园&动漫国字幕组",
+      "雪飘工作室",
+      "豌豆字幕组",
+      "幻樱字幕组",
+      "风之圣殿字幕组",
+      "北宇治字幕组",
+      "悠哈璃羽字幕社",
+      "霜庭云花Sub",
+      "绿茶字幕组",
+      "ANi",
+      "Nekomoe kissaten",
+      "Lilith-Raws",
+      "Skymoon-Raws"
     ],
     "require_keywords_any": [
       "简",
@@ -39,7 +56,11 @@
     "exclude_keywords": [
       "BIG5",
       "粤语",
-      "外挂"
+      "外挂",
+      "繁体",
+      "CHT",
+      "繁中",
+      "Traditional"
     ],
     "prefer_resolutions": [
       "1080p",
