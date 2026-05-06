@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Bangumi to Mikan to GuangYa sync daily
+
+[Timer]
+OnCalendar=*-*-* 00:10:00
+Persistent=true
+RandomizedDelaySec=2m
+Unit=bangumi-mikan-sync.service
+
+[Install]
+WantedBy=timers.target
