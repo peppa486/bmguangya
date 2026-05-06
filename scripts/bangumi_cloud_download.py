@@ -136,6 +136,20 @@ def extract_special_label(*texts: str) -> str:
     return ""
 
 
+def extract_chinese_episode_number(*texts: str) -> Optional[int]:
+    for text in texts:
+        if not text:
+            continue
+        for pattern in [
+            r"第\s*(\d{1,3})\s*[话話集]",
+            r"[【\[(（]\s*第\s*(\d{1,3})\s*[话話集]\s*[】\])）]",
+        ]:
+            match = re.search(pattern, text)
+            if match:
+                return int(match.group(1))
+    return None
+
+
 def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
     """Extract episode/special label for filename.
 
@@ -159,7 +173,11 @@ def extract_episode_label(source_title: str, resolved_file_name: str) -> str:
         return f"{start:02d}-{end:02d}"
 
     # Try single episode number
-    ep = parse_episode_number(source_title) or parse_episode_number(resolved_file_name)
+    ep = (
+        parse_episode_number(source_title)
+        or parse_episode_number(resolved_file_name)
+        or extract_chinese_episode_number(source_title, resolved_file_name)
+    )
     if ep is not None:
         return f"{ep:02d}"
 
@@ -189,13 +207,31 @@ def is_single_episode_candidate(title: str) -> bool:
     ``01-12.mkv`` folders/files beside normal episodes. Movie/OVA titles with no
     parsed episode number are still allowed unless they contain batch keywords.
     """
-    lower = (title or "").lower()
+    text = title or ""
+    lower = text.lower()
     if any(keyword in lower for keyword in [
         "合集", "全集", "全话", "全卷", "batch", "complete", "complete batch",
         "season batch", "vol.", "box",
     ]):
         return False
-    span = extract_episode_span(title or "")
+
+    # Some Mikan titles wrap ranges in Chinese brackets, e.g. 【第01-99话】.
+    # The shared extract_episode_span() may parse those as the first episode only,
+    # so reject explicit multi-episode ranges here before trusting the parser.
+    explicit_range_patterns = [
+        r"第\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*[话話集]",
+        r"[\[【(（]\s*(?:第\s*)?\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:[话話集])?\s*[\]】)）]",
+        r"(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}",
+    ]
+    for pattern in explicit_range_patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if not match:
+            continue
+        nums = [int(x) for x in re.findall(r"\d{1,3}", match.group(0))[:2]]
+        if len(nums) == 2 and nums[0] != nums[1]:
+            return False
+
+    span = extract_episode_span(text)
     if span and span[0] != span[1]:
         return False
     return True

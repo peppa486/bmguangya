@@ -35,6 +35,15 @@ class BangumiCloudDownloadNamingTests(unittest.TestCase):
         self.assertEqual(folder, '药屋少女的呢喃 第2期')
         self.assertEqual(filename, '18.mp4')
 
+    def test_build_target_names_parses_chinese_episode_marker(self):
+        folder, filename = mod.build_target_names(
+            display_name='宇宙兄弟',
+            source_title='【恶魔岛字幕组】★4月新番【宇宙兄弟_Uchuu Kyoudai】【第99话】[GB][720P][MP4][完]',
+            resolved_file_name='source.mkv',
+        )
+        self.assertEqual(folder, '宇宙兄弟')
+        self.assertEqual(filename, '99.mkv')
+
     def test_build_target_names_keeps_chinese_season_suffix_in_folder(self):
         folder, filename = mod.build_target_names(
             display_name='吹响吧！上低音号 第三季',
@@ -150,6 +159,7 @@ class BangumiCloudDownloadSelectionTests(unittest.TestCase):
         self.assertTrue(mod.is_single_episode_candidate('[字幕组] 测试番 [07][1080p]'))
         self.assertFalse(mod.is_single_episode_candidate('[字幕组] 测试番 [96-97][1080p]'))
         self.assertFalse(mod.is_single_episode_candidate('【字幕组】测试番 第01-12话 合集'))
+        self.assertFalse(mod.is_single_episode_candidate('【恶魔岛字幕组】★4月新番【宇宙兄弟_Uchuu Kyoudai】【第01-99话】[GB][720P][MP4][全]'))
         self.assertFalse(mod.is_single_episode_candidate('Test Show Complete Batch 01-12'))
         self.assertTrue(mod.is_single_episode_candidate('Movie Title BDRip 1080p'))
 

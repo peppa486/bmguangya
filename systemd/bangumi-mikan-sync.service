@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/opt/guangya-webdav/venv/bin/python /opt/anime-stack/scripts/bangumi_cloud_download.py --config /opt/anime-stack/config/bangumi-sync.json
+ExecStartPost=/opt/guangya-webdav/venv/bin/python /opt/anime-stack/scripts/generate_guangya_plan_cache.py
 WorkingDirectory=/opt/anime-stack
 User=root
 Group=root
