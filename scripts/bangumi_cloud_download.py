@@ -628,6 +628,29 @@ def extract_release_version(*texts: str) -> int:
     return max_version
 
 
+
+
+def episode_selection_sort_key(item: dict) -> tuple:
+    key = str(item.get("episode_key") or "")
+    m = re.match(r"ep-(\d{3})$", key)
+    if m:
+        return (2, int(m.group(1)), str(item.get("title") or ""))
+    m = re.match(r"range-(\d{3})-(\d{3})$", key)
+    if m:
+        return (1, int(m.group(2)), str(item.get("title") or ""))
+    return (0, 0, str(item.get("title") or ""))
+
+
+def apply_episode_limit(chosen_items: List[dict], cfg: dict, collection_type: int) -> List[dict]:
+    raw_limit = int(cfg.get("max_episodes_per_subject_per_run", cfg.get("daily_plan_episodes_per_subject", 1)) or 0)
+    if raw_limit <= 0 or len(chosen_items) <= raw_limit:
+        return chosen_items
+    mode = str(cfg.get("episode_selection_mode") or "latest").lower()
+    reverse = mode != "oldest"
+    ordered = sorted(chosen_items, key=episode_selection_sort_key, reverse=reverse)
+    limited = ordered[:raw_limit]
+    return sorted(limited, key=episode_selection_sort_key)
+
 def pick_best_per_episode(
     rss_items: List[dict],
     filters: dict,
@@ -837,6 +860,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
         # --- KEY CHANGE: pick best per episode, NOT all best items ---
         chosen_items = pick_best_per_episode(rss_items, cfg.get("filters", {}), locked_subgroup=locked_subgroup)
+        chosen_items = apply_episode_limit(chosen_items, cfg, collection_type)
         dedup_stats["total_rss_items"] += len(rss_items)
         dedup_stats["after_dedup"] += len(chosen_items)
         dedup_stats["subjects_processed"] += 1
