@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -641,8 +642,35 @@ def episode_selection_sort_key(item: dict) -> tuple:
     return (0, 0, str(item.get("title") or ""))
 
 
-def apply_episode_limit(chosen_items: List[dict], cfg: dict, collection_type: int) -> List[dict]:
-    raw_limit = int(cfg.get("max_episodes_per_subject_per_run", cfg.get("daily_plan_episodes_per_subject", 1)) or 0)
+def is_subject_airing(row: dict, cfg: dict) -> bool:
+    subject = row.get("subject") or {}
+    date_text = str(subject.get("date") or "").strip()
+    if not date_text:
+        return False
+    try:
+        start = date.fromisoformat(date_text[:10])
+    except Exception:
+        return False
+    today = datetime.now().astimezone().date()
+    if start > today:
+        return True
+    eps = int(subject.get("eps") or 0)
+    grace_days = int(cfg.get("airing_completion_grace_days", 14) or 14)
+    if eps > 0:
+        # Weekly TV anime: ep1 on start date, final ep roughly start+(eps-1)*7.
+        end = start + timedelta(days=max(eps - 1, 0) * 7 + grace_days)
+    else:
+        # Unknown length: treat recent shows as airing, old shows as completed.
+        end = start + timedelta(days=int(cfg.get("unknown_eps_airing_days", 180) or 180))
+    return today <= end
+
+
+def apply_episode_limit(chosen_items: List[dict], cfg: dict, row: dict, collection_type: int) -> List[dict]:
+    if not bool(cfg.get("limit_airing_subjects_to_latest", True)):
+        return chosen_items
+    if not is_subject_airing(row, cfg):
+        return chosen_items
+    raw_limit = int(cfg.get("airing_episodes_per_subject_per_run", cfg.get("daily_plan_episodes_per_subject", 1)) or 0)
     if raw_limit <= 0 or len(chosen_items) <= raw_limit:
         return chosen_items
     mode = str(cfg.get("episode_selection_mode") or "latest").lower()
@@ -754,14 +782,21 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     # Priority download order matters: e.g. [3, 1, 2] means spend the daily
     # quota on Bangumi "doing" first, then wish/collect only if quota remains.
     priority_rank = {ctype: idx for idx, ctype in enumerate(download_collection_type_order)}
-    collections = sorted(
-        collections,
-        key=lambda row: (
-            priority_rank.get(int(row.get("collection_type") or row.get("type") or 0), 999),
-            str(row.get("updated_at") or ""),
+    def collection_sort_key(row: dict) -> tuple:
+        ctype = int(row.get("collection_type") or row.get("type") or 0)
+        updated = str(row.get("updated_at") or "")
+        # In each collection bucket, currently-airing shows should be planned
+        # before completed backfill, so daily slots keep following new episodes.
+        airing_rank = 0 if is_subject_airing(row, cfg) else 1
+        return (
+            priority_rank.get(ctype, 999),
+            airing_rank,
+            # ISO timestamp: reverse via character inversion for descending sort.
+            ''.join(chr(255 - ord(ch)) for ch in updated),
             str(row.get("subject_id") or ((row.get("subject") or {}).get("id")) or ""),
-        ),
-    )
+        )
+
+    collections = sorted(collections, key=collection_sort_key)
 
     type_counts: Dict[str, int] = {}
     for row in collections:
@@ -860,7 +895,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
         # --- KEY CHANGE: pick best per episode, NOT all best items ---
         chosen_items = pick_best_per_episode(rss_items, cfg.get("filters", {}), locked_subgroup=locked_subgroup)
-        chosen_items = apply_episode_limit(chosen_items, cfg, collection_type)
+        chosen_items = apply_episode_limit(chosen_items, cfg, row, collection_type)
         dedup_stats["total_rss_items"] += len(rss_items)
         dedup_stats["after_dedup"] += len(chosen_items)
         dedup_stats["subjects_processed"] += 1

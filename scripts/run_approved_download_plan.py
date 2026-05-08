@@ -27,9 +27,9 @@ def main() -> int:
     cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
     cfg['dry_run'] = False
     cfg['download_subject_ids'] = subject_ids
-    cfg['max_download_subjects_per_run'] = min(int(cfg.get('daily_plan_subject_limit') or 3), len(subject_ids))
+    cfg['max_download_subjects_per_run'] = min(int(cfg.get('daily_plan_subject_limit') or 10), len(subject_ids))
     cfg['max_new_cloud_tasks_per_run'] = int(cfg.get('approved_plan_task_limit') or 200)
-    cfg['max_episodes_per_subject_per_run'] = int(cfg.get('daily_plan_episodes_per_subject') or 1)
+    cfg['airing_episodes_per_subject_per_run'] = int(cfg.get('daily_plan_episodes_per_subject') or 1)
     cfg['episode_selection_mode'] = cfg.get('episode_selection_mode') or 'latest'
 
     with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.json', delete=False) as f:

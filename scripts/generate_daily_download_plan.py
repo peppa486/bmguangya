@@ -32,9 +32,9 @@ def extract_json(text: str) -> dict:
 def main() -> int:
     cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
     cfg['dry_run'] = True
-    cfg['max_download_subjects_per_run'] = int(cfg.get('daily_plan_subject_limit') or 3)
+    cfg['max_download_subjects_per_run'] = int(cfg.get('daily_plan_subject_limit') or 10)
     cfg['max_new_cloud_tasks_per_run'] = int(cfg.get('daily_plan_task_limit') or 200)
-    cfg['max_episodes_per_subject_per_run'] = int(cfg.get('daily_plan_episodes_per_subject') or 1)
+    cfg['airing_episodes_per_subject_per_run'] = int(cfg.get('daily_plan_episodes_per_subject') or 1)
     cfg['episode_selection_mode'] = cfg.get('episode_selection_mode') or 'latest'
     cfg.pop('download_subject_ids', None)
 
@@ -87,7 +87,7 @@ def main() -> int:
             'collection_order': cfg.get('download_collection_types', [3, 1, 2]),
             'order_label': '在看 → 想看 → 看过',
             'requires_confirmation': True,
-            'episodes_per_subject': cfg.get('max_episodes_per_subject_per_run', 1),
+            'airing_episodes_per_subject': cfg.get('airing_episodes_per_subject_per_run', 1),
             'episode_selection_mode': cfg.get('episode_selection_mode', 'latest'),
         },
         'subject_ids': [x['subject_id'] for x in subjects],
@@ -104,7 +104,7 @@ def main() -> int:
     lines.append('## 明日光鸭下载候选计划（待确认）')
     lines.append('')
     lines.append(f"生成时间：{plan['created_at']}")
-    lines.append('策略：每天最多 3 部番；每部默认只取最新 1 集；顺序：在看 → 想看 → 看过。确认前不会真实下载。')
+    lines.append('策略：每天最多 10 部番；连载中每部只取最新 1 集；已完结番剧可补全候选；顺序：在看 → 想看 → 看过。确认前不会真实下载。')
     lines.append('')
     if not subjects:
         lines.append('没有找到可加入下载的候选。')
