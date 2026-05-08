@@ -704,6 +704,10 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     state_path = cfg.get("state_path", DEFAULT_STATE_PATH)
     raw_limit = int(cfg.get("max_new_cloud_tasks_per_run", 0) or 0)
     max_new_tasks_per_run: Optional[int] = raw_limit if raw_limit > 0 else None
+    raw_subject_limit = int(cfg.get("max_download_subjects_per_run", 0) or 0)
+    max_download_subjects_per_run: Optional[int] = raw_subject_limit if raw_subject_limit > 0 else None
+    download_subject_ids_cfg = cfg.get("download_subject_ids") or []
+    download_subject_ids = {str(x) for x in download_subject_ids_cfg if str(x).strip()}
     skip_watched = bool(cfg.get("skip_watched", True))
     persisted_state = load_state(state_path)
     state = copy.deepcopy(persisted_state) if dry_run else persisted_state
@@ -784,6 +788,8 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     skipped_existing_targets: List[dict] = []
     dedup_stats = {"total_rss_items": 0, "after_dedup": 0, "subjects_processed": 0}
     quota_exhausted = False
+    downloaded_subjects: List[dict] = []
+    downloaded_subject_id_set = set()
     total_collections = len(collections)
 
     write_progress("running", 0, total_collections, 0, max_new_tasks_per_run or 0, "")
@@ -791,6 +797,8 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     subject_idx = 0
     for row in collections:
         if max_new_tasks_per_run is not None and len(submitted) >= max_new_tasks_per_run:
+            break
+        if max_download_subjects_per_run is not None and len(downloaded_subject_id_set) >= max_download_subjects_per_run:
             break
         subject = row.get("subject", {})
         subject_id = str(row.get("subject_id") or subject.get("id") or "")
@@ -806,6 +814,9 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
         if collection_type not in download_collection_types:
             logger.info("Track only, skip download: %s (%s)", display, collection_label)
+            continue
+        if download_subject_ids and subject_id not in download_subject_ids:
+            logger.info("Not in approved download plan, skip download: %s (subject_id=%s)", display, subject_id)
             continue
 
         mikan_id = state["subject_to_mikan"].get(subject_id)
@@ -1004,6 +1015,15 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 "task_id": task_id,
                 "payload": payload,
             })
+            if subject_id not in downloaded_subject_id_set:
+                downloaded_subject_id_set.add(subject_id)
+                downloaded_subjects.append({
+                    "subject_id": subject_id,
+                    "show": display,
+                    "collection": collection_label,
+                    "category_dir": category_dir,
+                    "show_dir": show_dir,
+                })
         if quota_exhausted:
             break
 
@@ -1031,6 +1051,9 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         "tracked_type_counts": type_counts,
         "removed_subject_ids": removed_subject_ids,
         "download_collection_types": download_collection_type_order,
+        "max_download_subjects_per_run": max_download_subjects_per_run,
+        "download_subject_ids": sorted(download_subject_ids),
+        "downloaded_subjects": downloaded_subjects,
         "sync_actions": applied_sync_actions,
         "dedup_stats": dedup_stats,
         "submitted": submitted,
