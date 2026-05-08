@@ -10,7 +10,7 @@ Primary path:
 KEY RULE: Each anime gets AT MOST one file per episode.
   - For movies/OVAs (single file): submit only the single best version
   - For TV shows: submit one best version per episode
-  - Collection packs are treated as one "episode range" unit
+  - Collection packs/batches are rejected; GuangYa cannot split them safely
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ CONFIG_FILE = "/opt/guangya-webdav/config/config.json"
 SYNC_CONFIG = "/opt/anime-stack/config/bangumi-sync.json"
 DEFAULT_STATE_PATH = "/opt/anime-stack/state/bangumi-sync-state.json"
 DEFAULT_ROOT_DIR = "Anime"
+PROGRESS_FILE = "/opt/anime-stack/state/sync-progress.json"
 CLOUD_CREATE_TASK_URL = "https://api.guangyapan.com/cloudcollection/v1/create_task"
 CLOUD_LIST_TASK_URL = "https://api.guangyapan.com/cloudcollection/v1/list_task"
 CLOUD_RESOLVE_TORRENT_URL = "https://api.guangyapan.com/cloudcollection/v1/resolve_torrent"
@@ -68,6 +69,27 @@ COLLECTION_DIR_LABELS = {
 def read_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def write_progress(status: str, current: int = 0, total: int = 0,
+                   submitted: int = 0, max_tasks: int = 0,
+                   current_show: str = "", extra: Optional[dict] = None) -> None:
+    """Write live sync progress for the monitor dashboard to poll."""
+    payload = {
+        "status": status,
+        "current_subject": current,
+        "total_subjects": total,
+        "submitted_count": submitted,
+        "max_tasks": max_tasks,
+        "current_show": current_show,
+        "updated_at": now(),
+    }
+    if extra:
+        payload.update(extra)
+    try:
+        write_json(PROGRESS_FILE, payload)
+    except Exception:
+        pass
 
 
 def sanitize_component(text: str) -> str:
@@ -250,9 +272,11 @@ def is_single_episode_candidate(title: str) -> bool:
     # so reject explicit multi-episode ranges here before trusting the parser.
     explicit_range_patterns = [
         r"第\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*[话話集]",
-        r"[\[【(（]\s*(?:第\s*)?\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:[话話集])?\s*[\]】)）]",
-        r"\b(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\b",
-        r"\d{1,3}-\d{1,3}\s*(?:话|集|ep)",
+        # [01-13Fin], [01-13 END], 【第01-99话】, (01~12)
+        r"[\[【(（]\s*(?:第\s*)?\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:[A-Za-z]{2,5})?\s*(?:[话話集])?\s*[\]】)）]",
+        r"\b(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:fin|end)?\b",
+        r"\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:话|話|集|ep|fin|end)",
+        r"(?:sp|ova|oad|特典)\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}",
     ]
     for pattern in explicit_range_patterns:
         match = re.search(pattern, text, flags=re.I)
@@ -390,6 +414,42 @@ def ensure_child_dir(client: GuangYaClient, parent_id: str, dir_name: str) -> st
     if not file_id:
         raise RuntimeError(f"failed to create dir {dir_name!r} under {parent_id}: {created}")
     return str(file_id)
+
+
+def canonical_target_name(name: str) -> str:
+    """Normalize GuangYa duplicate suffixes like 01(1).mkv back to 01.mkv."""
+    return re.sub(r"\(\d+\)(?=(?:\.[^./]+)?$)", "", (name or "").strip())
+
+
+def get_remote_folder_name_index(
+    client: GuangYaClient,
+    folder_id: str,
+    cache: Dict[str, set],
+) -> set:
+    """Return canonical names already present in a GuangYa folder.
+
+    This complements state-based de-duplication: if files were created before
+    state tracking existed, or were manually moved into the folder, GuangYa would
+    otherwise auto-rename a new task to 01(1).mkv.
+    """
+    if folder_id in cache:
+        return cache[folder_id]
+    names = set()
+    page = 0
+    while True:
+        result = client.get_file_list(parent_id=folder_id, page_size=500, page=page)
+        items = get_list_items(result)
+        if not items:
+            break
+        for item in items:
+            file_name = item.get("fileName") or ""
+            if file_name:
+                names.add(canonical_target_name(file_name))
+        if len(items) < 500:
+            break
+        page += 1
+    cache[folder_id] = names
+    return names
 
 
 def apply_subject_sync_actions(client: Optional[GuangYaClient], root_dir_id: str, actions: List[dict], state: dict, dry_run: bool) -> List[dict]:
@@ -595,6 +655,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     state_path = cfg.get("state_path", DEFAULT_STATE_PATH)
     raw_limit = int(cfg.get("max_new_cloud_tasks_per_run", 0) or 0)
     max_new_tasks_per_run: Optional[int] = raw_limit if raw_limit > 0 else None
+    skip_watched = bool(cfg.get("skip_watched", True))
     persisted_state = load_state(state_path)
     state = copy.deepcopy(persisted_state) if dry_run else persisted_state
     state.setdefault("seen_guids", [])
@@ -606,6 +667,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     state.setdefault("subject_locations", {})
     seen = set(state["seen_guids"])
     existing_targets = build_existing_target_index(state)
+    remote_folder_name_cache: Dict[str, set] = {}
 
     bangumi = BangumiClient(cfg["bangumi"])
     mikan = MikanClient(cfg.get("mikan", {}))
@@ -668,11 +730,16 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
     submitted: List[dict] = []
     unresolved: List[dict] = []
+    mismatched: List[dict] = []
     skipped_watched: List[dict] = []
     skipped_existing_targets: List[dict] = []
     dedup_stats = {"total_rss_items": 0, "after_dedup": 0, "subjects_processed": 0}
     quota_exhausted = False
+    total_collections = len(collections)
 
+    write_progress("running", 0, total_collections, 0, max_new_tasks_per_run or 0, "")
+
+    subject_idx = 0
     for row in collections:
         if max_new_tasks_per_run is not None and len(submitted) >= max_new_tasks_per_run:
             break
@@ -685,6 +752,8 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         collection_label = COLLECTION_TYPE_LABELS.get(collection_type, str(collection_type))
         category_dir, show_dir = build_subject_path(display, collection_type)
         logger.info("Processing: %s (subject_id=%s, collection=%s)", display, subject_id, collection_label)
+        subject_idx += 1
+        write_progress("running", subject_idx, total_collections, len(submitted), max_new_tasks_per_run or 0, display)
 
         if collection_type not in download_collection_types:
             logger.info("Track only, skip download: %s (%s)", display, collection_label)
@@ -718,6 +787,27 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
         logger.info("Selected %d items from %d RSS entries for: %s", len(chosen_items), len(rss_items), display)
 
+        # Mismatch detection: Bangumi says multi-episode TV series but Mikan only has movie/compilation
+        ep_status = int(row.get("ep_status") or 0)
+        if ep_status >= 3 and len(chosen_items) <= 2:
+            movie_kw = ("剧场版", "劇場版", "MOVIE", "Movie", "movie", "剧场", "劇場", "合集", "全集", "RE:cycle")
+            titles_joined = " ".join(item.get("title", "") for item in chosen_items)
+            if any(kw in titles_joined for kw in movie_kw):
+                mikan_title = (best_bangumi or {}).get("title", "")
+                logger.warning(
+                    "Mismatch: %s has %d eps on Bangumi but Mikan only has movie/compilation: %s",
+                    display, ep_status, mikan_title,
+                )
+                mismatched.append({
+                    "subject_id": subject_id,
+                    "title": display,
+                    "collection": collection_label,
+                    "ep_status": ep_status,
+                    "mikan_title": mikan_title,
+                    "reason": f"Mikan只有剧场版/合集，Bangumi标记了{ep_status}集",
+                })
+                continue
+
         related_subject_rows = [candidate for candidate in collections if candidate is not row]
 
         for item in chosen_items:
@@ -733,8 +823,8 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
             if not torrent_url:
                 continue
 
-            # Skip already-watched episodes
-            if should_skip_watched(row, item):
+            # Skip already-watched episodes (unless skip_watched is disabled)
+            if skip_watched and should_skip_watched(row, item):
                 watched_ep = int(row.get("ep_status") or 0)
                 logger.info("Skip watched ep (watched=%d): %s :: %s", watched_ep, display, item["title"])
                 skipped_watched.append({"subject_id": subject_id, "title": display, "item_title": item["title"]})
@@ -761,13 +851,25 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 payload = build_create_task_payload(magnet, folder_id, file_name)
 
             target_key = f"{category_dir}/{show_dir}/{file_name}"
-            if target_key in existing_targets:
-                logger.info("Skip duplicate target path: %s :: %s", target_key, item["title"])
+            canonical_file_name = canonical_target_name(file_name)
+            duplicate_reason = "state" if target_key in existing_targets else ""
+            if not duplicate_reason and not dry_run and client is not None:
+                remote_names = get_remote_folder_name_index(client, folder_id, remote_folder_name_cache)
+                if canonical_file_name in remote_names:
+                    duplicate_reason = "remote"
+            if duplicate_reason:
+                logger.info(
+                    "Skip duplicate target path (%s): %s :: %s",
+                    duplicate_reason,
+                    target_key,
+                    item["title"],
+                )
                 skipped_existing_targets.append({
                     "subject_id": subject_id,
                     "show": display,
                     "title": item["title"],
                     "target": target_key,
+                    "reason": duplicate_reason,
                 })
                 continue
 
@@ -793,6 +895,8 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 )
 
             existing_targets.add(target_key)
+            if not dry_run and folder_id in remote_folder_name_cache:
+                remote_folder_name_cache[folder_id].add(canonical_file_name)
             seen.add(guid)
             state["seen_guids"].append(guid)
             matched_subgroup = item.get("matched_subgroup")
@@ -839,14 +943,21 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
     state["tracked_subjects"] = tracked_subjects
     state["removed_subject_ids"] = removed_subject_ids
+    state["mismatched_subjects"] = mismatched
     state["last_run"] = now()
     state["last_cloud_sync"] = now()
     if not dry_run:
         write_json(state_path, state)
 
+    final_status = "quota_exhausted" if quota_exhausted else "done"
+    write_progress(final_status, total_collections, total_collections, len(submitted),
+                   max_new_tasks_per_run or 0, "",
+                   extra={"unresolved": len(unresolved), "mismatched": len(mismatched)})
+
     return {
         "submitted_count": len(submitted),
         "unresolved_count": len(unresolved),
+        "mismatched_count": len(mismatched),
         "skipped_watched_count": len(skipped_watched),
         "skipped_existing_target_count": len(skipped_existing_targets),
         "dry_run": dry_run,
@@ -858,6 +969,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         "dedup_stats": dedup_stats,
         "submitted": submitted,
         "unresolved": unresolved,
+        "mismatched": mismatched,
         "skipped_watched": skipped_watched[:20],
         "skipped_existing_targets": skipped_existing_targets[:20],
     }
