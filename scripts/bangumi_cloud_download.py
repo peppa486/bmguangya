@@ -273,9 +273,9 @@ def is_single_episode_candidate(title: str) -> bool:
     explicit_range_patterns = [
         r"第\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*[话話集]",
         # [01-13Fin], [01-13 END], 【第01-99话】, (01~12)
-        r"[\[【(（]\s*(?:第\s*)?\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:[A-Za-z]{2,5})?\s*(?:[话話集])?\s*[\]】)）]",
-        r"\b(?:ep|e)?\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:fin|end)?\b",
-        r"\d{1,3}\s*[-~～—–]\s*\d{1,3}\s*(?:话|話|集|ep|fin|end)",
+        r"[\[【(（]\s*(?:第\s*)?\d{1,3}(?:v\d{1,2})?\s*[-~～—–]\s*\d{1,3}(?:v\d{1,2})?\s*(?:[A-Za-z0-9]{1,6})?\s*(?:[话話集])?\s*[\]】)）]",
+        r"\b(?:ep|e)?\s*\d{1,3}(?:v\d{1,2})?\s*[-~～—–]\s*\d{1,3}(?:v\d{1,2})?\s*(?:fin|end)?\b",
+        r"\d{1,3}(?:v\d{1,2})?\s*[-~～—–]\s*\d{1,3}(?:v\d{1,2})?\s*(?:话|話|集|ep|fin|end)",
         r"(?:sp|ova|oad|特典)\s*\d{1,3}\s*[-~～—–]\s*\d{1,3}",
     ]
     for pattern in explicit_range_patterns:
@@ -515,6 +515,55 @@ def resolve_torrent(client: GuangYaClient, torrent_url: str) -> Dict[str, Any]:
 
 def create_cloud_task(client: GuangYaClient, payload: Dict[str, Any]) -> Dict[str, Any]:
     return client._request("POST", CLOUD_CREATE_TASK_URL, data=payload)
+
+
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
+
+
+def choose_single_video_file_index(bt_info: dict, source_title: str, target_name: str) -> Optional[List[int]]:
+    # Choose exactly one video subfile from a resolved torrent. GuangYa may
+    # otherwise add every file in a multi-file torrent, so a 200-task run can
+    # consume ~1000 cloud-add quota. Return None for single-file torrents,
+    # a one-item list for safe multi-file torrents, or [] when ambiguous/unsafe.
+    subfiles = bt_info.get("subfiles") or []
+    if not subfiles:
+        return None
+
+    target_label = Path(target_name).stem
+    video_files = []
+    for sub in subfiles:
+        name = sub.get("fileName") or ""
+        if Path(name).suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        idx = sub.get("fileIndex")
+        if idx is None:
+            continue
+        video_files.append(sub)
+
+    if len(video_files) == 1:
+        return [int(video_files[0]["fileIndex"])]
+
+    matching = []
+    for sub in video_files:
+        name = sub.get("fileName") or ""
+        label = extract_episode_label(name, name)
+        if not label:
+            special = extract_special_label(name)
+            strict_ep = extract_strict_episode_number(name)
+            if special:
+                label = special
+            elif strict_ep is not None:
+                label = f"{strict_ep:02d}"
+            else:
+                tail_match = re.search(r"(?:^|[\s._-])(\d{1,3})(?=\.[^.]+$)", name)
+                if tail_match:
+                    label = f"{int(tail_match.group(1)):02d}"
+        if label and label == target_label:
+            matching.append(sub)
+
+    if len(matching) == 1:
+        return [int(matching[0]["fileIndex"])]
+    return []
 
 
 def refresh_cloud_tasks(client: GuangYaClient, state: dict) -> None:
@@ -845,10 +894,27 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                     logger.warning("skip unresolved torrent: %s :: %s", display, torrent_url)
                     continue
                 _, file_name = build_target_names(display, item["title"], resolved_name)
+                file_indexes = choose_single_video_file_index(bt_info, item["title"], file_name)
+                if file_indexes == []:
+                    logger.info(
+                        "Skip ambiguous multi-file torrent: %s :: %s (target=%s, subfiles=%s)",
+                        display,
+                        item["title"],
+                        file_name,
+                        bt_info.get("subfilesNum") or len(bt_info.get("subfiles") or []),
+                    )
+                    skipped_existing_targets.append({
+                        "subject_id": subject_id,
+                        "show": display,
+                        "title": item["title"],
+                        "target": f"{category_dir}/{show_dir}/{file_name}",
+                        "reason": "ambiguous_multi_file_torrent",
+                    })
+                    continue
                 category_id = ensure_child_dir(client, root_dir_id, category_dir)
                 folder_id = ensure_child_dir(client, category_id, show_dir)
                 magnet = f"magnet:?xt=urn:btih:{info_hash}"
-                payload = build_create_task_payload(magnet, folder_id, file_name)
+                payload = build_create_task_payload(magnet, folder_id, file_name, file_indexes=file_indexes)
 
             target_key = f"{category_dir}/{show_dir}/{file_name}"
             canonical_file_name = canonical_target_name(file_name)
