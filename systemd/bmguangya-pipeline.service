@@ -1,0 +1,31 @@
+[Unit]
+Description=Run one locked Bangumi, GuangYa, cloud reconcile, and Jellyfin sync cycle
+Requires=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/bmguangya/config.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+StateDirectory=bmguangya
+StateDirectoryMode=0750
+WorkingDirectory=/opt/bmguangya
+ExecStart=/usr/bin/flock --exclusive --nonblock --conflict-exit-code 75 /var/lib/bmguangya/pipeline.lock /bin/bash -euc 'systemctl start --wait bmguangya-inventory.service && systemctl start --wait bmguangya-download.service && systemctl start --wait bmguangya-inventory.service && systemctl start --wait bmguangya-reconcile.service && systemctl start --wait bmguangya-inventory.service && systemctl start --wait bmguangya-strm-sync.service'
+TimeoutStartSec=450min
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/bmguangya
+ReadOnlyPaths=/etc/bmguangya/config.json
+
+[Install]
+WantedBy=multi-user.target

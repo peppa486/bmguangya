@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "cloud_complete": true,
+  "generated_at": "2026-10-17T00:00:00+00:00",
+  "last_success_at": "2026-10-17T00:00:00+00:00",
+  "freshness": {"state": "fresh", "age_seconds": 0, "ttl_seconds": 900},
+  "source": {
+    "cloud_root": "/guangya/Anime",
+    "cloud_refresh": true,
+    "test_secret": "must-not-appear-in-report"
+  },
+  "counts": {
+    "bangumi_targets": 2,
+    "cloud_directories": 4,
+    "cloud_video_files": 4,
+    "missing_episodes": 1
+  },
+  "tree": [
+    {
+      "category": "在看",
+      "path": "在看",
+      "shows": [
+        {
+          "name": "药屋少女的呢喃",
+          "cloud_name": "药屋少女的呢喃",
+          "subject_id": "12345",
+          "matched": true,
+          "ambiguous": false,
+          "unmatched": false,
+          "source_path": "在看/药屋少女的呢喃",
+          "path": "在看/药屋少女的呢喃",
+          "expected_eps": ["EP01", "EP02"],
+          "present_eps": ["EP01"],
+          "missing_eps": ["EP02"],
+          "extra_eps": [
+            {"name": "OVA01.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/OVA01.mkv", "reason": "episode_not_in_bangumi"}
+          ],
+          "duplicate_eps": ["EP01"],
+          "coverage_unknown": false,
+          "count": 3,
+          "vids": [
+            {"name": "01.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/01.mkv"},
+            {"name": "01-copy.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/01-copy.mkv"},
+            {"name": "OVA01.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/OVA01.mkv"}
+          ],
+          "episodes": [
+            {"episode_key": "EP01", "present": true, "present_files": [
+              {"name": "01.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/01.mkv"},
+              {"name": "01-copy.mkv", "relative_path": "在看/药屋少女的呢喃/Disc 01/01-copy.mkv"}
+            ]},
+            {"episode_key": "EP02", "present": false, "missing": true, "present_files": []}
+          ],
+          "children": [
+            {
+              "name": "Disc 01",
+              "type": "directory",
+              "path": "在看/药屋少女的呢喃/Disc 01",
+              "size": null,
+              "modified": null,
+              "empty": false,
+              "children": [
+                {"name": "01.mkv", "type": "file", "path": "在看/药屋少女的呢喃/Disc 01/01.mkv", "size": 1024, "modified": "2026-10-16T00:00:00Z"},
+                {"name": "01-copy.mkv", "type": "file", "path": "在看/药屋少女的呢喃/Disc 01/01-copy.mkv", "size": 2048, "modified": "2026-10-16T00:00:00Z"},
+                {"name": "OVA01.mkv", "type": "file", "path": "在看/药屋少女的呢喃/Disc 01/OVA01.mkv", "size": 3072, "modified": "2026-10-16T00:00:00Z"}
+              ]
+            },
+            {"name": "empty-subdir", "type": "directory", "path": "在看/药屋少女的呢喃/empty-subdir", "size": null, "modified": null, "empty": true, "children": []}
+          ]
+        },
+        {
+          "name": "新番（云盘未创建）",
+          "subject_id": "98765",
+          "matched": false,
+          "ambiguous": false,
+          "unmatched": true,
+          "source_path": null,
+          "path": null,
+          "expected_eps": ["EP01"],
+          "present_eps": [],
+          "missing_eps": ["EP01"],
+          "extra_eps": [],
+          "duplicate_eps": [],
+          "coverage_unknown": false,
+          "count": 0,
+          "episodes": [],
+          "children": []
+        }
+      ],
+      "loose_files": []
+    },
+    {"category": "未标记", "path": "未标记", "shows": [
+      {
+        "name": "未匹配云盘目录",
+        "subject_id": null,
+        "matched": false,
+        "ambiguous": false,
+        "unmatched": true,
+        "source_path": "未标记/未匹配云盘目录",
+        "path": "未标记/未匹配云盘目录",
+        "expected_eps": [],
+        "present_eps": [],
+        "missing_eps": [],
+        "extra_eps": [{"name": "episode-title.mkv", "relative_path": "未标记/未匹配云盘目录/episode-title.mkv", "reason": "unrecognized_episode_filename"}],
+        "duplicate_eps": [],
+        "coverage_unknown": true,
+        "coverage_issues": [{"code": "unknown_episode_number", "message": "未能识别 Bangumi 集号"}],
+        "count": 1,
+        "episodes": [],
+        "children": [
+          {"name": "episode-title.mkv", "type": "file", "path": "未标记/未匹配云盘目录/episode-title.mkv", "size": 4096, "modified": "2026-10-16T00:00:00Z"}
+        ]
+      }
+    ], "loose_files": [
+      {"name": "readme.txt", "type": "file", "path": "未标记/readme.txt", "size": 12}
+    ]},
+    {"category": "想看", "path": "想看", "shows": [], "loose_files": []},
+    {"category": "看过", "path": "看过", "shows": [], "loose_files": []}
+  ]
+}

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
-import difflib
 import html
 import json
 import os
@@ -9,6 +8,7 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,6 +54,116 @@ def normalize_title(text: str) -> str:
     return text
 
 
+def normalize_mikan_title(text: str) -> str:
+    """Normalize punctuation and width while preserving kana and all scripts."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _explicit_season_marker(text: str) -> Optional[int]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    chinese_digits = {
+        "零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+        "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+
+    def parse_number(value: str) -> Optional[int]:
+        if value.isdigit():
+            number = int(value)
+        elif all(char in chinese_digits or char == "十" for char in value):
+            if value.count("十") > 1:
+                return None
+            if "十" not in value:
+                # Accept common written ordinals (二) and digit-by-digit forms (〇二).
+                number = int("".join(str(chinese_digits[char]) for char in value))
+            else:
+                tens_text, ones_text = value.split("十")
+                if (len(tens_text) > 1 or len(ones_text) > 1
+                        or (tens_text and tens_text not in chinese_digits)
+                        or (ones_text and ones_text not in chinese_digits)):
+                    return None
+                tens = chinese_digits[tens_text] if tens_text else 1
+                ones = chinese_digits[ones_text] if ones_text else 0
+                number = tens * 10 + ones
+        else:
+            return None
+        return number if 1 <= number <= 99 else None
+
+    chinese_or_arabic_number = r"(?:\d{1,2}|[零〇一二三四五六七八九十]{1,3})"
+    patterns = (
+        rf"第\s*({chinese_or_arabic_number})\s*(?:季|期|部|クール)",
+        r"\bseason\s*(\d{1,2})\b",
+        r"\bs(\d{1,2})\b",
+        r"\b(\d{1,2})(?:st|nd|rd|th)\s*season\b",
+        r"\bpart\s*(\d{1,2})\b",
+        r"\bcour\s*(\d{1,2})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.I)
+        if match:
+            parsed = parse_number(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _explicit_format(text: str) -> Optional[str]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    if re.search(r"剧场版|劇場版|movie|film|総集編|総集篇|总集篇|总集编", normalized):
+        return "movie"
+    if re.search(r"\bova\b|\boad\b|\bona\b", normalized):
+        if re.search(r"\bova\b", normalized):
+            return "ova"
+        if re.search(r"\boad\b", normalized):
+            return "oad"
+        return "ona"
+    if re.search(r"\bweb(?:アニメ|anime|series)?\b", normalized):
+        return "web"
+    if re.search(r"\btv(?:アニメ|版|series)?\b", normalized):
+        return "tv"
+    return None
+
+
+def _subject_format(subject: dict) -> Optional[str]:
+    value = unicodedata.normalize("NFKC", str(subject.get("platform") or "")).casefold()
+    if not value:
+        return None
+    if any(token in value for token in ("剧场", "劇場", "movie", "film", "映画")):
+        return "movie"
+    if "ova" in value:
+        return "ova"
+    if "oad" in value:
+        return "oad"
+    if "ona" in value:
+        return "ona"
+    if "web" in value:
+        return "web"
+    if "tv" in value or "テレビ" in value:
+        return "tv"
+    return None
+
+
+def _is_tv_subject(subject: dict) -> bool:
+    fmt = _subject_format(subject)
+    if fmt == "tv":
+        return True
+    episodes = subject.get("eps") or subject.get("total_episodes") or 0
+    try:
+        return int(episodes) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_cached_mikan_mapping(subject_row: dict, bangumi_id: str,
+                                  title: str) -> Optional[dict]:
+    """Revalidate persisted mappings against the current exact subject title."""
+    if not bangumi_id or not title:
+        return None
+    return MikanClient({}).choose_best_bangumi(
+        subject_row, [{"bangumi_id": str(bangumi_id), "title": str(title)}],
+    )
+
+
 def sanitize_path_component(text: str) -> str:
     text = (text or "").strip()
     text = re.sub(r'[\\/:*?"<>|]+', ' ', text)
@@ -68,8 +178,21 @@ def subject_savepath(base_savepath: str, show_title: str, subject_id: str) -> st
 
 def request(url: str, *, method: str = "GET", headers: Optional[dict] = None, data: Optional[bytes] = None, timeout: int = 30) -> bytes:
     req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            time.sleep(0.4 * (attempt + 1))
+    raise last_error
+
+
+class IncompleteCollectionError(RuntimeError):
+    """Bangumi collection pagination was malformed or stopped before total."""
 
 
 class BangumiClient:
@@ -89,6 +212,8 @@ class BangumiClient:
         items = []
         offset = 0
         limit = 30
+        expected_total = None
+        seen_subject_ids = set()
         while True:
             qs = urllib.parse.urlencode({
                 "subject_type": 2,
@@ -97,28 +222,59 @@ class BangumiClient:
                 "offset": offset,
             })
             url = f"{self.base_url}/v0/users/{urllib.parse.quote(self.username)}/collections?{qs}"
-            payload = json.loads(request(url, headers=self._headers()).decode("utf-8"))
-            chunk = payload.get("data", [])
+            try:
+                payload = json.loads(request(url, headers=self._headers()).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise IncompleteCollectionError("Bangumi returned invalid collection JSON") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise IncompleteCollectionError("Bangumi collection response has no data list")
+            if not isinstance(payload.get("total"), int) or payload["total"] < 0:
+                raise IncompleteCollectionError("Bangumi collection response has no valid total")
+            if expected_total is None:
+                expected_total = payload["total"]
+            elif payload["total"] != expected_total:
+                raise IncompleteCollectionError("Bangumi collection total changed during pagination")
+            chunk = payload["data"]
+            if offset < expected_total and not chunk:
+                raise IncompleteCollectionError("Bangumi collection ended before the reported total")
+            if len(chunk) > limit:
+                raise IncompleteCollectionError("Bangumi returned more rows than requested")
             for row in chunk:
+                if not isinstance(row, dict):
+                    raise IncompleteCollectionError("Bangumi collection contains a malformed row")
+                subject = row.get("subject") if isinstance(row.get("subject"), dict) else {}
+                subject_id = str(row.get("subject_id") or subject.get("id") or "")
+                if not subject_id:
+                    raise IncompleteCollectionError("Bangumi collection row has no subject id")
+                if subject_id in seen_subject_ids:
+                    raise IncompleteCollectionError("Bangumi collection pagination repeated a subject")
+                seen_subject_ids.add(subject_id)
                 row["collection_type"] = int(row.get("type") or collection_type)
             items.extend(chunk)
-            total = payload.get("total", len(items))
-            if not chunk or len(items) >= total:
+            if len(items) == expected_total:
                 break
-            offset += limit
+            if len(items) > expected_total:
+                raise IncompleteCollectionError("Bangumi collection exceeded the reported total")
+            offset += len(chunk)
+            if offset <= 0:
+                raise IncompleteCollectionError("Bangumi collection offset did not advance")
             time.sleep(0.3)
         return items
 
     def get_combined_anime_collections(self, collection_types: List[int]) -> List[dict]:
         merged = []
-        seen = set()
+        seen = {}
         for collection_type in collection_types:
             for row in self.get_anime_collections(collection_type):
                 subject = row.get("subject", {})
                 subject_id = str(row.get("subject_id") or subject.get("id") or "")
-                if not subject_id or subject_id in seen:
-                    continue
-                seen.add(subject_id)
+                if not subject_id:
+                    raise IncompleteCollectionError("Bangumi collection row has no subject id")
+                if subject_id in seen:
+                    raise IncompleteCollectionError(
+                        "Bangumi subject appeared in multiple collection types"
+                    )
+                seen[subject_id] = collection_type
                 merged.append(row)
         return merged
 
@@ -143,35 +299,72 @@ class MikanClient:
                 if not name:
                     continue
                 seen[bangumi_id] = {"bangumi_id": bangumi_id, "title": name}
-            if seen:
-                break
-        return list(seen.values())[: self.max_candidates]
+        # Search all Bangumi aliases. A Chinese title query can return only
+        # similarly named theatrical entries while the Japanese alias contains
+        # the television series. Keep exact title hits ahead of fuzzy noise
+        # before applying the configured candidate cap.
+        aliases = {normalize_mikan_title(title) for title in title_candidates if title}
+        candidates = list(seen.values())
+        exact = [row for row in candidates
+                 if normalize_mikan_title(row.get("title")) in aliases]
+        other = [row for row in candidates if row not in exact]
+        return exact + other[:max(0, self.max_candidates - len(exact))]
 
-    def choose_best_bangumi(self, subject: dict, candidates: List[dict]) -> Optional[dict]:
+    def choose_best_bangumi(self, subject: dict, candidates: List[dict], *,
+                            extra_exact_titles: Optional[List[str]] = None) -> Optional[dict]:
         if not candidates:
             return None
-        titles = []
         subj = subject.get("subject", {})
-        for key in ("name_cn", "name"):
-            if subj.get(key):
-                titles.append(subj[key])
-        titles = [t for t in titles if t]
-        best = None
-        best_score = -1.0
+        if not isinstance(subj, dict):
+            return None
+        titles = [subj.get(key) for key in ("name_cn", "name") if subj.get(key)]
+        aliases = {normalize_mikan_title(title) for title in titles if title}
+        aliases.update(
+            normalize_mikan_title(title)
+            for title in (extra_exact_titles or []) if title
+        )
+        if not aliases:
+            return None
+        subject_seasons = {
+            season for season in (_explicit_season_marker(title) for title in titles)
+            if season is not None
+        }
+        subject_format = _subject_format(subj)
+        is_tv = _is_tv_subject(subj)
+        matched = {}
         for cand in candidates:
-            cand_norm = normalize_title(cand["title"])
-            score = 0.0
-            for t in titles:
-                tn = normalize_title(t)
-                if tn and cand_norm:
-                    score = max(score, difflib.SequenceMatcher(None, tn, cand_norm).ratio())
-                    if tn in cand_norm or cand_norm in tn:
-                        score += 0.35
-            if score > best_score:
-                best = cand
-                best_score = score
-        if best:
-            best["score"] = round(best_score, 4)
+            title = str(cand.get("title") or "")
+            cand_norm = normalize_mikan_title(title)
+            if not cand_norm or cand_norm not in aliases:
+                continue
+
+            candidate_season = _explicit_season_marker(title)
+            if subject_seasons:
+                # Ambiguous Bangumi aliases with conflicting season markers do
+                # not prove which Mikan season is intended.
+                if candidate_season is None or candidate_season not in subject_seasons:
+                    continue
+            elif candidate_season is not None:
+                continue
+
+            candidate_format = _explicit_format(title)
+            if is_tv and candidate_format == "movie":
+                continue
+            if (subject_format and candidate_format
+                    and subject_format != candidate_format):
+                continue
+
+            bangumi_id = str(cand.get("bangumi_id") or "")
+            if not bangumi_id:
+                continue
+            matched[bangumi_id] = cand
+
+        # Even exact aliases can map to duplicate entries. Require one unique
+        # Mikan Bangumi ID after title, season, and format checks.
+        if len(matched) != 1:
+            return None
+        best = next(iter(matched.values()))
+        best["score"] = 1.0
         return best
 
     def fetch_rss_items(self, bangumi_id: str) -> List[dict]:
@@ -461,6 +654,7 @@ def load_state(path: str) -> dict:
     return {
         "seen_guids": [],
         "subject_to_mikan": {},
+        "subject_to_mikan_title": {},
         "subject_subgroups": {},
         "tracked_subjects": {},
         "removed_subject_ids": [],
@@ -547,6 +741,7 @@ def main() -> int:
     state = load_state(state_path)
     state.setdefault("seen_guids", [])
     state.setdefault("subject_to_mikan", {})
+    state.setdefault("subject_to_mikan_title", {})
     state.setdefault("subject_subgroups", {})
     state.setdefault("tracked_subjects", {})
     state.setdefault("removed_subject_ids", [])
@@ -622,14 +817,14 @@ def main() -> int:
             continue
 
         mikan_id = state["subject_to_mikan"].get(subject_id)
-        best = None
-        if mikan_id:
-            best = {"bangumi_id": mikan_id, "title": "cached"}
-        else:
+        cached_title = state["subject_to_mikan_title"].get(subject_id, "")
+        best = validate_cached_mikan_mapping(row, str(mikan_id or ""), cached_title)
+        if not best:
             candidates = mikan.search_bangumi([title_cn, title_jp])
             best = mikan.choose_best_bangumi(row, candidates)
             if best and best.get("bangumi_id"):
                 state["subject_to_mikan"][subject_id] = best["bangumi_id"]
+                state["subject_to_mikan_title"][subject_id] = str(best.get("title") or "")
                 log(f"Mapped to Mikan bangumiId={best['bangumi_id']} title={best['title']} score={best.get('score')}")
 
         if not best:

@@ -1,0 +1,27 @@
+[Unit]
+Description=Run the approved Bangumi to Mikan to GuangYa download stage
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/bmguangya/config.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+StateDirectory=bmguangya
+StateDirectoryMode=0750
+WorkingDirectory=/opt/bmguangya
+ExecStart=/opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/bangumi_cloud_download.py --config /etc/bmguangya/config.json --apply
+TimeoutStartSec=40min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/bmguangya
+ReadOnlyPaths=/etc/bmguangya/config.json

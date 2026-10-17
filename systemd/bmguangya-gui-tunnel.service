@@ -1,0 +1,29 @@
+[Unit]
+Description=Secure SSH tunnel for the read-only Bangumi and GuangYa monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/ssh -N -T -F /root/.ssh/config -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:19988:127.0.0.1:9988 bmguangya-host
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/root/.ssh
+
+[Install]
+WantedBy=multi-user.target

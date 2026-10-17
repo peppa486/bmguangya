@@ -1,0 +1,29 @@
+[Unit]
+Description=Read-only Bangumi and GuangYa inventory monitor on loopback
+After=network.target
+ConditionPathExists=/opt/bmguangya/monitor/index.html
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0027
+WorkingDirectory=/opt/bmguangya
+ExecStart=/opt/bmguangya/.venv/bin/python /opt/bmguangya/monitor/server.py --host 127.0.0.1 --port 9988 --state-dir /var/lib/bmguangya
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/opt/bmguangya/monitor /var/lib/bmguangya
+
+[Install]
+WantedBy=multi-user.target

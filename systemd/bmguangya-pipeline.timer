@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the single-host Bangumi and GuangYa pipeline every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:10,40:00 Asia/Shanghai
+AccuracySec=1s
+Persistent=true
+Unit=bmguangya-pipeline.service
+
+[Install]
+WantedBy=timers.target
