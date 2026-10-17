@@ -530,7 +530,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     print(json.dumps({"report": result.get("report_path"), **result.get("summary", {})}, ensure_ascii=False))
     summary = result.get("summary", {})
-    return 1 if args.apply and (summary.get("pending_count") or summary.get("blocked_count")) else 0
+    # Blocked actions are safe per-item skips (for example, duplicate names or
+    # an existing target) and must not stop downstream pipeline stages. An
+    # unresolved request is different: callers should stop until its readback
+    # is reconciled. Fatal setup/validation errors return 2 above.
+    return 1 if summary.get("pending_count") else 0
 
 
 if __name__ == "__main__":

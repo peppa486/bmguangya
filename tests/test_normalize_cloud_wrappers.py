@@ -1,5 +1,7 @@
 import copy
+import contextlib
 import datetime as dt
+import io
 import json
 import subprocess
 import sys
@@ -405,6 +407,41 @@ class NormalizeCloudWrappersTests(unittest.TestCase):
             self.assertEqual(inventory_path.read_bytes(), inventory_before)
             self.assertEqual(configured_reconcile_report.read_text(encoding="utf-8"),
                              "preserve reconcile output")
+
+    def test_cli_safe_blocked_candidate_exits_zero(self):
+        script_path = Path(wrapper.__file__).resolve()
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
+            inventory = make_inventory()
+            show_node = rec._node_by_relative_path(inventory["inventory_root"], SHOW_REL)
+            show_node["children"].append(file_node(WRAPPER_NAME, "same-name-file"))
+            inventory["tree"][0]["shows"][0]["children"].append(file_node(WRAPPER_NAME, "same-name-file"))
+            config_path, inventory_path, reconcile_report = self._setup_files(tmp, inventory)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["alist"]["api_base"] = "http://127.0.0.1:1"
+            write_json(config_path, config)
+
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--config", str(config_path),
+                 "--inventory", str(inventory_path), "--report", str(Path(tmp) / "blocked.json"), "--apply"],
+                cwd=tmp, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["blocked_count"], 1)
+            self.assertEqual(output["pending_count"], 0)
+
+    def test_main_returns_one_for_pending_action(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
+            config_path = Path(tmp) / "unused.json"
+            stdout = io.StringIO()
+            with mock.patch.object(wrapper, "run", return_value={
+                    "report_path": str(Path(tmp) / "report.json"),
+                    "summary": {"pending_count": 1, "blocked_count": 0}}) as run_mock:
+                with contextlib.redirect_stdout(stdout):
+                    code = wrapper.main(["--config", str(config_path)])
+            self.assertEqual(code, 1)
+            run_mock.assert_called_once()
+            self.assertEqual(json.loads(stdout.getvalue())["pending_count"], 1)
 
 
 if __name__ == "__main__":

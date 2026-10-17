@@ -141,6 +141,58 @@ def add_verified_duplicate_episode(inventory, *, second_gcid=None, second_size=1
     return inventory
 
 
+def add_content_variant_episode(inventory, clusters, *, shared_loser_directory=False):
+    """Add ordinary EP01 copies grouped by GCID/size for variant tests.
+
+    Each cluster is a dict with ``gcid``, ``size`` and ``copies``. A copy is a
+    ``(relative_path, name, file_id)`` tuple. The base inventory's Disc 01
+    video is reused when its path appears in a cluster.
+    """
+    show = inventory["tree"][0]["shows"][0]
+    show.update({"expected_eps_count": 1, "duplicate_eps": ["EP01"]})
+    episode = show["episodes"][0]
+    show_node = inventory["inventory_root"]["children"][0]["children"][0]
+    disc_one = next(child for child in show_node["children"] if child["name"] == "Disc 01")
+    base_path = SHOW_REL + "/Disc 01/01.mkv"
+    disc_two = None
+    evidence = []
+
+    for cluster in clusters:
+        for relative_path, name, file_id in cluster["copies"]:
+            if relative_path == base_path:
+                node = next(child for child in disc_one["children"] if child["name"] == name)
+            else:
+                parts = relative_path.split("/")
+                parent_parts = parts[:-1]
+                if "/".join(parent_parts) == SHOW_REL:
+                    parent = show_node
+                elif "/".join(parent_parts) == SHOW_REL + "/Disc 01":
+                    parent = disc_one
+                elif "/".join(parent_parts) == SHOW_REL + "/Disc 02":
+                    if disc_two is None:
+                        disc_two = dnode("Disc 02", [], file_id="disc-two")
+                        show_node["children"].append(disc_two)
+                    parent = disc_two
+                else:
+                    raise AssertionError("unsupported test path: " + relative_path)
+                node = fnode(name, file_id)
+                parent["children"].append(node)
+            node.update({"file_id": file_id, "size": cluster["size"], "gcid": cluster["gcid"]})
+            evidence.append({"relative_path": relative_path, "path": relative_path,
+                             "name": name, "file_id": file_id,
+                             "size": cluster["size"], "gcid": cluster["gcid"]})
+
+    if shared_loser_directory:
+        # The caller places all non-keeper videos under Disc 01; its existing
+        # 01.ass remains an exact companion for the base 01.mkv copy.
+        disc_one["file_id"] = "disc-one"
+    first = evidence[0]
+    episode.update({"file_id": first["file_id"], "relative_path": first["relative_path"],
+                    "file_name": first["name"], "present": True, "missing": False,
+                    "present_files": evidence})
+    return inventory
+
+
 def make_verified_duplicate_pack_inventory(*, second_episode=False):
     inventory = add_verified_duplicate_episode(make_inventory(extra=False))
     show = inventory["tree"][0]["shows"][0]
@@ -368,6 +420,148 @@ class ReconcilePlanTests(unittest.TestCase):
         self.assertFalse(any(row.get("code") in {"not_single_file", "duplicate_episode", "unpaired_subtitle"}
                              and row.get("episode_key") == "EP01" for row in plan["unresolved"]))
 
+    def test_duplicate_content_is_deduplicated_per_verified_content_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_content_variant_episode(make_inventory(extra=False), [
+                {"gcid": "a" * 40, "size": 100, "copies": [
+                    (SHOW_REL + "/Disc 01/01.mkv", "01.mkv", "video-1"),
+                    (SHOW_REL + "/EP01.mkv", "EP01.mkv", "variant-a-root"),
+                ]},
+                {"gcid": "b" * 40, "size": 200, "copies": [
+                    (SHOW_REL + "/Disc 02/01-b.mkv", "01-b.mkv", "variant-b-copy"),
+                    (SHOW_REL + "/EP01-b.mkv", "EP01-b.mkv", "variant-b-root"),
+                ]},
+            ])
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        duplicate_videos = [row for row in plan["actions"]
+                            if row.get("role") == "duplicate_content_video"]
+        self.assertEqual(len(duplicate_videos), 2)
+        by_gcid = {row["content_gcid"]: row for row in duplicate_videos}
+        self.assertEqual(set(by_gcid), {"a" * 40, "b" * 40})
+        self.assertEqual(by_gcid["a" * 40]["content_size"], 100)
+        self.assertEqual(by_gcid["a" * 40]["kept_relative_path"], SHOW_REL + "/EP01.mkv")
+        self.assertEqual(by_gcid["a" * 40]["source_relative_path"], SHOW_REL + "/Disc 01/01.mkv")
+        self.assertEqual(by_gcid["b" * 40]["content_size"], 200)
+        self.assertEqual(by_gcid["b" * 40]["kept_relative_path"], SHOW_REL + "/EP01-b.mkv")
+        self.assertEqual(by_gcid["b" * 40]["source_relative_path"], SHOW_REL + "/Disc 02/01-b.mkv")
+        variants = next(row for row in plan["unresolved"]
+                        if row.get("code") == "duplicate_content_variants")
+        self.assertEqual([row["copy_count"] for row in variants["content_variants"]], [2, 2])
+        self.assertFalse(any(row.get("role") == "video" and row.get("episode_key") == "EP01"
+                             for row in plan["actions"]))
+
+    def test_duplicate_content_variant_with_2_plus_1_only_moves_the_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_content_variant_episode(make_inventory(extra=False), [
+                {"gcid": "a" * 40, "size": 100, "copies": [
+                    (SHOW_REL + "/Disc 01/01.mkv", "01.mkv", "video-1"),
+                    (SHOW_REL + "/EP01.mkv", "EP01.mkv", "variant-a-root"),
+                ]},
+                {"gcid": "b" * 40, "size": 200, "copies": [
+                    (SHOW_REL + "/EP01-b.mkv", "EP01-b.mkv", "variant-b-only"),
+                ]},
+            ])
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        duplicate_videos = [row for row in plan["actions"]
+                            if row.get("role") == "duplicate_content_video"]
+        self.assertEqual(len(duplicate_videos), 1)
+        self.assertEqual(duplicate_videos[0]["file_id"], "video-1")
+        self.assertEqual(duplicate_videos[0]["content_gcid"], "a" * 40)
+        self.assertEqual(duplicate_videos[0]["content_size"], 100)
+        self.assertEqual(duplicate_videos[0]["kept_relative_path"], SHOW_REL + "/EP01.mkv")
+        self.assertFalse(any(row.get("file_id") == "variant-b-only" for row in plan["actions"]))
+        variants = next(row for row in plan["unresolved"]
+                        if row.get("code") == "duplicate_content_variants")
+        self.assertEqual([row["copy_count"] for row in variants["content_variants"]], [2, 1])
+
+    def test_distinct_hash_singletons_stay_blocked_and_skip_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_content_variant_episode(make_inventory(extra=False), [
+                {"gcid": "a" * 40, "size": 100, "copies": [
+                    (SHOW_REL + "/Disc 01/01.mkv", "01.mkv", "video-1"),
+                ]},
+                {"gcid": "b" * 40, "size": 200, "copies": [
+                    (SHOW_REL + "/EP01.mkv", "EP01.mkv", "variant-b-only"),
+                ]},
+            ])
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        variants = next(row for row in plan["unresolved"]
+                        if row.get("code") == "duplicate_content_variants")
+        self.assertEqual(variants["state"], "blocked")
+        self.assertEqual([row["copy_count"] for row in variants["content_variants"]], [1, 1])
+        self.assertFalse(any(row.get("subject_id") == "123" and row.get("episode_key") == "EP01"
+                             for row in plan["actions"]))
+
+    def test_duplicate_content_ambiguous_path_or_invalid_hash_fails_entire_episode(self):
+        cases = ("invalid_hash", "ambiguous_path")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                inventory = add_content_variant_episode(make_inventory(extra=False), [
+                    {"gcid": "a" * 40, "size": 100, "copies": [
+                        (SHOW_REL + "/Disc 01/01.mkv", "01.mkv", "video-1"),
+                        (SHOW_REL + "/EP01.mkv", "EP01.mkv", "variant-a-root"),
+                    ]},
+                    {"gcid": "b" * 40, "size": 200, "copies": [
+                        (SHOW_REL + "/Disc 02/01-b.mkv", "01-b.mkv", "variant-b-copy"),
+                        (SHOW_REL + "/EP01-b.mkv", "EP01-b.mkv", "variant-b-root"),
+                    ]},
+                ])
+                episode = inventory["tree"][0]["shows"][0]["episodes"][0]
+                if case == "invalid_hash":
+                    evidence = next(row for row in episode["present_files"]
+                                    if row["file_id"] == "variant-b-copy")
+                    evidence["gcid"] = "invalid"
+                else:
+                    # The same path component resolves to a file and directory,
+                    # so the nested video path cannot be uniquely verified.
+                    inventory["inventory_root"]["children"][0]["children"][0]["children"].append(
+                        fnode("Disc 01", "same-name-file"))
+                cfg = config(tmp)
+                cfg["organize_unassigned"] = True
+                plan = rec.build_plan(inventory, cfg)
+
+                self.assertFalse(any(row.get("role", "").startswith("duplicate_content_")
+                                     for row in plan["actions"]))
+                self.assertIn("duplicate_content_unverified", {row.get("code") for row in plan["unresolved"]})
+
+    def test_directory_collapse_accepts_distinct_clusters_with_all_keepers_outside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_content_variant_episode(make_inventory(extra=False), [
+                {"gcid": "a" * 40, "size": 100, "copies": [
+                    (SHOW_REL + "/Disc 01/01.mkv", "01.mkv", "video-1"),
+                    (SHOW_REL + "/EP01.mkv", "EP01.mkv", "variant-a-root"),
+                ]},
+                {"gcid": "b" * 40, "size": 200, "copies": [
+                    (SHOW_REL + "/Disc 01/01-b.mkv", "01-b.mkv", "variant-b-copy"),
+                    (SHOW_REL + "/EP01-b.mkv", "EP01-b.mkv", "variant-b-root"),
+                ]},
+            ], shared_loser_directory=True)
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            cfg["collapse_verified_duplicate_directories"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        directory = next(row for row in plan["actions"]
+                         if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(directory["source_relative_path"], SHOW_REL + "/Disc 01")
+        video_evidence = [row for row in directory["covered_duplicate_evidence"]
+                          if row.get("role") == "duplicate_content_video"]
+        self.assertEqual({row["content_gcid"] for row in video_evidence}, {"a" * 40, "b" * 40})
+        self.assertEqual({row["kept_relative_path"] for row in video_evidence},
+                         {SHOW_REL + "/EP01.mkv", SHOW_REL + "/EP01-b.mkv"})
+        self.assertTrue(all(not row["kept_relative_path"].startswith(directory["source_relative_path"] + "/")
+                            for row in video_evidence))
+        self.assertEqual(len(directory["covered_action_ids"]), 3)
+
     def test_verified_directory_collapse_is_opt_in_and_keeps_full_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             inventory = make_verified_duplicate_pack_inventory(second_episode=True)
@@ -444,12 +638,12 @@ class ReconcilePlanTests(unittest.TestCase):
 
     def test_different_or_missing_content_evidence_keeps_every_duplicate_in_place(self):
         cases = (
-            {"second_gcid": "b" * 40},
-            {"second_size": 101},
-            {"first_size": 0},
-            {"first_gcid": None},
+            ({"second_gcid": "b" * 40}, "duplicate_content_variants"),
+            ({"second_size": 101}, "duplicate_content_variants"),
+            ({"first_size": 0}, "duplicate_content_unverified"),
+            ({"first_gcid": None}, "duplicate_content_unverified"),
         )
-        for kwargs in cases:
+        for kwargs, expected_issue in cases:
             with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as tmp:
                 inventory = add_verified_duplicate_episode(make_inventory(extra=False), **kwargs)
                 cfg = config(tmp)
@@ -459,7 +653,9 @@ class ReconcilePlanTests(unittest.TestCase):
                                      for row in plan["actions"]))
                 self.assertFalse(any(row.get("target_relative_path", "").startswith(
                     "未标记/待核对-重复内容/") for row in plan["actions"]))
-                self.assertIn("not_single_file", {row["code"] for row in plan["unresolved"]})
+                self.assertIn(expected_issue, {row["code"] for row in plan["unresolved"]})
+                if expected_issue == "duplicate_content_unverified":
+                    self.assertIn("not_single_file", {row["code"] for row in plan["unresolved"]})
 
     def test_unmatched_and_unknown_files_are_not_guessed(self):
         with tempfile.TemporaryDirectory() as tmp:

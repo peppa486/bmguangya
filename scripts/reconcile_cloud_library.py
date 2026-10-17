@@ -385,10 +385,12 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
                                              all_shows: Sequence[Tuple[str, dict]]) -> Tuple[List[dict], List[dict], set]:
     """Quarantine provably identical duplicate ordinary episode copies.
 
-    The episode key and unique Bangumi match scope the comparison. GCIDs are
-    never compared across shows. A duplicate group is moved only if every copy
-    has the same valid 40-hex GCID and positive, equal size, and every source
-    file (including exact-basename subtitles) has a stable inventory identity.
+    The subject and episode key scope comparisons. GCIDs are never compared
+    across shows or episodes. Every copy must have a valid GCID/positive size
+    and a unique identity-backed path; within each (GCID, size) cluster, one
+    stable keeper remains and only byte-identical copies are quarantined. When
+    an episode has multiple content clusters, retain an unresolved explanation
+    and never normalize those versions to one canonical episode filename.
     """
     root = inventory["inventory_root"]
     subject_id = str(show.get("subject_id") or "")
@@ -499,8 +501,6 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
             continue
 
         evidence_rows = []
-        gcids = set()
-        sizes = set()
         seen_ids = set()
         seen_paths = set()
         for evidence in copies:
@@ -537,13 +537,8 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
                 break
             seen_ids.add(file_id)
             seen_paths.add(relative)
-            gcids.add(gcid)
-            sizes.add(size)
             evidence_rows.append({"name": name, "relative_path": relative, "file_id": file_id,
                                   "gcid": gcid, "size": size, "node": node})
-        if valid and (len(gcids) != 1 or len(sizes) != 1):
-            valid = False
-            invalid_reason = "duplicate copies have different GCIDs or file sizes"
         if not valid:
             issues.append({"subject_id": subject_id, "show_name": show_name, "episode_key": key,
                            "relative_paths": [row.get("relative_path") for row in evidence_rows]
@@ -552,52 +547,88 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
                            "message": invalid_reason})
             continue
 
+        content_groups: Dict[Tuple[str, int], List[dict]] = {}
+        for evidence in evidence_rows:
+            content_groups.setdefault((evidence["gcid"], evidence["size"]), []).append(evidence)
+        if len(content_groups) > 1:
+            # These are distinct versions of the same Bangumi episode key.
+            # Preserve one copy of every version and make the unresolved
+            # semantic conflict visible even when safe duplicate copies are
+            # separately quarantined below.
+            issues.append({
+                "subject_id": subject_id, "show_name": show_name, "episode_key": key,
+                "state": "blocked", "code": "duplicate_content_variants",
+                "message": "episode has {} distinct GCID/size content variants; one copy of each is retained".format(
+                    len(content_groups)),
+                "content_variants": [{
+                    "gcid": gcid, "size": size, "copy_count": len(rows),
+                    "relative_paths": sorted(row["relative_path"] for row in rows),
+                } for (gcid, size), rows in sorted(content_groups.items())],
+            })
+            # Do not let ordinary episode normalization select one of several
+            # valid versions, including when all clusters are singletons.
+            handled_keys.add(key)
+
         canonical_name = re.compile(r"^{}\.[^.]+$".format(re.escape(key)), re.I)
-        evidence_rows.sort(key=lambda row: (
-            0 if (len(_clean_relative_path(row["relative_path"], field="duplicate source")) == len(show_parts) + 1
-                  and canonical_name.fullmatch(row["name"])) else 1,
-            len(_clean_relative_path(row["relative_path"], field="duplicate source")) - len(show_parts),
-            row["relative_path"].casefold(), row["relative_path"], row["file_id"],
-        ))
-        kept = evidence_rows[0]
         loser_bundles = []
-        for video in evidence_rows[1:]:
-            source_parts = _clean_relative_path(video["relative_path"], field="duplicate source")
-            source_parent = "/".join(source_parts[:-1])
-            stem = _normalize_stem(video["name"])
-            same_stem_videos = [node for node in show_files
-                                if PurePosixPath(node["name"]).suffix.lower() in VIDEO_SUFFIXES
-                                and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
-                                and _normalize_stem(node["name"]) == stem]
-            if len(same_stem_videos) != 1 or same_stem_videos[0]["_relative_path"] != video["relative_path"]:
-                valid = False
-                invalid_reason = "exact-basename subtitle association is ambiguous"
-                break
-            subtitles = [node for node in show_files
-                         if PurePosixPath(node["name"]).suffix.lower() in SUBTITLE_SUFFIXES
-                         and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
-                         and _normalize_stem(node["name"]) == stem]
-            bundle = [{"name": video["name"], "relative_path": video["relative_path"],
-                       "file_id": video["file_id"], "role": "video"}]
-            for subtitle in subtitles:
-                subtitle_id = _file_id(subtitle)
-                subtitle_path = subtitle["_relative_path"]
-                subtitle_node = _node_by_relative_path(root, subtitle_path)
-                if (not subtitle_id or subtitle_node is None or _is_dir(subtitle_node)
-                        or _file_id(subtitle_node) != subtitle_id):
+        def keeper_sort_key(row: dict) -> tuple:
+            parts = _clean_relative_path(row["relative_path"], field="duplicate source")
+            return (
+                0 if (len(parts) == len(show_parts) + 1 and canonical_name.fullmatch(row["name"])) else 1,
+                len(parts) - len(show_parts),
+                row["relative_path"].casefold(), row["relative_path"], row["file_id"],
+            )
+
+        for (content_gcid, content_size), cluster_rows in sorted(content_groups.items()):
+            cluster_rows = sorted(cluster_rows, key=keeper_sort_key)
+            kept = cluster_rows[0]
+            for video in cluster_rows[1:]:
+                source_parts = _clean_relative_path(video["relative_path"], field="duplicate source")
+                source_parent = "/".join(source_parts[:-1])
+                stem = _normalize_stem(video["name"])
+                same_stem_videos = [node for node in show_files
+                                    if PurePosixPath(node["name"]).suffix.lower() in VIDEO_SUFFIXES
+                                    and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
+                                    and _normalize_stem(node["name"]) == stem]
+                if len(same_stem_videos) != 1 or same_stem_videos[0]["_relative_path"] != video["relative_path"]:
                     valid = False
-                    invalid_reason = "an exact-basename subtitle has no stable file identity"
+                    invalid_reason = "exact-basename subtitle association is ambiguous"
                     break
-                bundle.append({"name": subtitle["name"], "relative_path": subtitle_path,
-                               "file_id": subtitle_id, "role": "subtitle"})
+                subtitles = [node for node in show_files
+                             if PurePosixPath(node["name"]).suffix.lower() in SUBTITLE_SUFFIXES
+                             and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
+                             and _normalize_stem(node["name"]) == stem]
+                bundle = [{"name": video["name"], "relative_path": video["relative_path"],
+                           "file_id": video["file_id"], "role": "video"}]
+                for subtitle in subtitles:
+                    subtitle_id = _file_id(subtitle)
+                    subtitle_path = subtitle["_relative_path"]
+                    subtitle_node = _node_by_relative_path(root, subtitle_path)
+                    if (not subtitle_id or subtitle_node is None or _is_dir(subtitle_node)
+                            or _file_id(subtitle_node) != subtitle_id):
+                        valid = False
+                        invalid_reason = "an exact-basename subtitle has no stable file identity"
+                        break
+                    bundle.append({"name": subtitle["name"], "relative_path": subtitle_path,
+                                   "file_id": subtitle_id, "role": "subtitle"})
+                if not valid:
+                    break
+                loser_bundles.append({"items": bundle, "kept": kept,
+                                      "content_gcid": content_gcid, "content_size": content_size})
             if not valid:
                 break
-            loser_bundles.append(bundle)
         if not valid:
             issues.append({"subject_id": subject_id, "show_name": show_name, "episode_key": key,
-                           "relative_paths": [row["relative_path"] for row in evidence_rows[1:]],
+                           "relative_paths": [row["relative_path"] for row in evidence_rows],
                            "state": "blocked", "code": "duplicate_content_unverified",
                            "message": invalid_reason})
+            continue
+
+        if not loser_bundles:
+            # Multiple valid singleton clusters need no move, but remain
+            # handled so a later ordinary pass cannot overwrite one version.
+            if len(content_groups) > 1:
+                handled_keys.add(key)
             continue
 
         if not target_ready:
@@ -612,7 +643,9 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
 
         planned_bundle_actions = []
         planned_names = set(used_names)
-        for bundle in loser_bundles:
+        for loser in loser_bundles:
+            bundle = loser["items"]
+            kept = loser["kept"]
             video = bundle[0]
             extension = PurePosixPath(video["name"]).suffix
             original_stem = video["name"][:-len(extension)]
@@ -646,7 +679,7 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
                     "action_id": action_id, "kind": "organize_move",
                     "role": "duplicate_content_" + item["role"], "reason": "duplicate_content",
                     "subject_id": subject_id, "show_name": show_name, "episode_key": key,
-                    "content_gcid": evidence_rows[0]["gcid"], "content_size": evidence_rows[0]["size"],
+                    "content_gcid": loser["content_gcid"], "content_size": loser["content_size"],
                     "kept_relative_path": kept["relative_path"], "source_kind": "file",
                     "category": category, "file_id": item["file_id"],
                     "original_name": item["name"], "current_name": item["name"],
