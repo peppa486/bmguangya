@@ -12,7 +12,9 @@
 6. 向 Jellyfin 发送媒体库刷新请求。Jellyfin 需要由管理员安装、配置兼容当前 Jellyfin 版本的 Bangumi 元数据插件；HTTP 2xx 只表示刷新请求已接受，不代表插件已完成刮削。
 7. 在 VidHub 中手动添加 Jellyfin 服务器并使用 Jellyfin 账号登录。VidHub 是播放客户端，不由本程序配置；客户端能否播放还取决于 Jellyfin 与 AList WebDAV 地址对客户端可达。
 
-自动化面向可由规则确认的常见场景，不替代人工审核。重复版本的选择按发布版本和候选评分确定；目标冲突、重复集号、未知集、覆盖范围不可靠或云端证据不一致时会阻止对应操作。`reconcile.organize_unassigned` 默认关闭；启用全树整理前应先生成并审阅 dry-run 报告。
+自动化面向可由规则确认的常见场景，不替代人工审核。新下载候选按发布版本和候选评分选择；已有文件只有在同一条目、同一集的 GCID 与正文件大小完全一致时才收纳多余副本。若同集存在不同内容，每种内容各保留一份，并记录版本差异，不自动判断哪种画质更好。目标冲突、重复集号、未知集、覆盖范围不可靠或云端证据不一致时会阻止对应操作。`reconcile.organize_unassigned` 默认关闭；启用全树整理前应先生成并审阅 dry-run 报告。
+
+Bangumi 的 [`ep` 与 `sort`](https://raw.githubusercontent.com/bangumi/api/master/open-api/v0.yaml) 可以不同：例如本条目第 1 集的 `ep=1`，跨季排序为 `sort=13`。库存使用完整、唯一且连续的元数据建立双编号映射，保留文件原始集号及对应 Bangumi episode ID；明确使用季内编号的目录会对应到规范的 `sort` 集号。编号域重叠、混用或元数据不可靠时标为覆盖未知，停止该条目的自动补缺。单集来源选择和提交前查重使用同一映射；需要转换编号的合集目前会保守跳过并记录原因，普通同编号合集仍可按缺集拆分。
 
 ## 部署前提
 
@@ -62,7 +64,7 @@ sudoedit /etc/bmguangya/config.json
 | `jellyfin.base_url`, `jellyfin.token` | Jellyfin API 地址及专用 API token。建议创建权限最小的专用 token。若 token 留空，代码可以从 `jellyfin.db_path` 以只读方式读取 `jellyfin.username` 最近活动会话的 token。 |
 | `inventory.cloud_source` | `guangya_direct` 直接分页扫描光鸭目录，或 `alist` 通过 AList 文件 API 扫描。AList 挂载仍是凭据刷新和 STRM 播放所需依赖。 |
 | `reconcile.organize_unassigned` | 示例默认 `false`，先保守运行。用户已授权完整整理时可以设为 `true`，把可安全识别的未归类内容移动至“未标记/待核对”；不确定内容仍会留在原位。务必先看 dry-run 报告。 |
-| `reconcile.normalize_video_named_directories` | 默认 `true`。仅对唯一匹配番剧下、实际类型为目录且名称以视频扩展名结尾的直接子目录追加 `[资源包]`，可带 `(N)` 后缀；移动前核对完整子树，普通视频不改名。已确认的目录重命名会更新中间库存路径，保留原始扫描时间戳，不把路径维护伪装成新的全盘扫描。 |
+| `reconcile.normalize_video_named_directories` | 默认 `true`。仅对唯一匹配番剧下、实际类型为目录且名称以视频扩展名结尾的直接子目录追加 `[资源包]`，可带 `(N)` 后缀；改名前核对完整子树，普通视频不改名。同名文件与目录造成路径歧义时跳过。已确认的目录重命名会更新中间库存路径，保留原始扫描时间戳，不把路径维护伪装成新的全盘扫描。 |
 | `reconcile.collapse_verified_duplicate_directories` | 默认 `false`，且需要 `organize_unassigned=true`。当一个子目录中的全部视频均为已证明相同内容的重复件、保留件全在目录外时，可整包收纳，保留字幕及辅助文件。移动前递归核对完整目录清单；任何新增、缺失或变化都会阻止整包移动。 |
 
 样例的 `dry_run` 保持 `true`，用于保护直接调用。仓库流水线单元会显式以 `--apply` 运行下载、整理和 STRM 同步；只有完成下方检查并由部署者启用 timer 后，定时器才会执行这些写操作。

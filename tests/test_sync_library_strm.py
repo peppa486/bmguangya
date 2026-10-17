@@ -11,6 +11,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import library_inventory as library_inv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import sync_library_strm as sync
 
@@ -79,6 +81,42 @@ def inventory(*shows: dict) -> dict:
             for category in sync.CATEGORIES
         ],
     }
+
+
+def bangumi_inventory_show(title: str, subject_id: str, sort_start: int, count: int,
+                           filenames: list[str]) -> dict:
+    subject = {
+        "subject_id": subject_id,
+        "collection_type": 3,
+        "subject": {"id": int(subject_id), "name": title, "name_cn": title},
+    }
+    source_path = "在看/" + title
+    raw_episodes = [{
+        "id": 900000 + index,
+        "subject_id": int(subject_id),
+        "type": 0,
+        "sort": sort_start + index - 1,
+        "ep": index,
+        "name": "Episode {}".format(index),
+        "airdate": "2020-01-01",
+    } for index in range(1, count + 1)]
+    episode_rows = library_inv.episode_records(raw_episodes, subject_id, today=NOW.date())
+    cloud_node = {
+        "name": title,
+        "path": source_path,
+        "type": "directory",
+        "children": [{
+            "name": filename,
+            "path": source_path + "/" + filename,
+            "type": "file",
+            "file_id": "file-{}".format(index),
+            "size": 100,
+        } for index, filename in enumerate(filenames, start=1)],
+    }
+    return library_inv.show_node_from_cloud(
+        cloud_node, subject=subject, episodes=episode_rows, expected_known=True,
+        target_category="在看",
+    )
 
 
 def unmatched_show_at(source_path: str, title: str, file_paths: list[str], *, episode_key: str) -> dict:
@@ -540,23 +578,64 @@ class SyncLibraryStrmTests(unittest.TestCase):
             with self.assertRaisesRegex(sync.SyncError, "symlink"):
                 sync.apply_plan(planned, cfg)
 
-    def test_unknown_episode_coverage_preserves_old_local_indexes(self):
+    def test_blocked_episode_number_overlap_preserves_indexes_without_strm_or_nfo_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             media = root / "media"
             archive = root / "archive"
             cfg = sync.validate_config(config(media, archive))
-            show_with_unknown_coverage = show()
-            show_with_unknown_coverage["coverage_unknown"] = True
-            current_dir = media / "在看" / "Bangumi 准确标题"
+            blocked_show = bangumi_inventory_show(
+                "重叠编号条目", "765432", sort_start=13, count=13,
+                filenames=["EP{:02d}.mkv".format(index) for index in range(1, 13)],
+            )
+            self.assertTrue(blocked_show["coverage_unknown"])
+            self.assertEqual(blocked_show["episode_numbering"]["reason"],
+                             "episode_numbering_domain_overlap")
+            current_dir = media / "在看" / "重叠编号条目"
             current_dir.mkdir(parents=True)
+            existing = current_dir / "EP01.strm"
+            original_strm = b"http://old.invalid/kept.mkv\n"
+            existing.write_bytes(original_strm)
             stale = current_dir / "EP99.strm"
-            stale.write_text("http://old.invalid/99.mkv\n", encoding="utf-8")
+            stale.write_bytes(b"http://old.invalid/stale.mkv\n")
+            nfo = current_dir / "tvshow.nfo"
+            original_nfo = sync.make_show_nfo("765432", "Old title")
+            nfo.write_bytes(original_nfo)
 
-            planned, unresolved, _ = sync.build_show_plan(inventory(show_with_unknown_coverage), cfg)
+            planned, unresolved, _ = sync.build_show_plan(inventory(blocked_show), cfg)
             self.assertTrue(any(row["reason"] == "bangumi_episode_coverage_unknown" for row in unresolved))
+            self.assertEqual(len(planned), 1)
+            self.assertTrue(planned[0]["skip_apply"])
+            self.assertFalse(planned[0]["cleanup_safe"])
+            self.assertEqual(planned[0]["episodes"], [])
+            self.assertIsNone(planned[0]["nfo_title"])
             sync.apply_plan(planned, cfg)
+            self.assertEqual(existing.read_bytes(), original_strm)
             self.assertTrue(stale.is_file())
+            self.assertEqual(nfo.read_bytes(), original_nfo)
+            self.assertFalse((current_dir / "EP02.strm").exists())
+
+    def test_season_relative_inventory_mapping_plans_sort_key_and_keeps_episode_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            mapped_show = bangumi_inventory_show(
+                "连续剧第二季", "765433", sort_start=13, count=12, filenames=["EP01.mkv"],
+            )
+            self.assertEqual(mapped_show["episode_numbering"]["mode"], "season_relative")
+            self.assertFalse(mapped_show["coverage_unknown"])
+
+            planned, unresolved, _ = sync.build_show_plan(inventory(mapped_show), cfg)
+
+            self.assertEqual(unresolved, [])
+            self.assertEqual(len(planned), 1)
+            self.assertFalse(planned[0]["skip_apply"])
+            self.assertEqual(planned[0]["episodes"], [{
+                "episode_key": "EP13",
+                "relative_path": "在看/连续剧第二季/EP01.mkv",
+                "local_path": "在看/连续剧第二季/EP13.strm",
+                "episode_id": "900001",
+            }])
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 15
 DEFAULT_DIRECTORY_MAX_ATTEMPTS = 3
+BANGUMI_EPISODE_SCHEMA_URL = "https://raw.githubusercontent.com/bangumi/api/master/open-api/v0.yaml"
 
 
 class InventoryError(RuntimeError):
@@ -1039,6 +1040,230 @@ def _episode_file_match(video: dict, expected_keys: set) -> Optional[str]:
     return parsed if parsed in expected_keys else None
 
 
+def _strict_positive_integer(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number <= 0 or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
+_CHINESE_NUMBER_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _partition_number(value: str) -> Optional[int]:
+    value = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if value.isdigit():
+        return int(value)
+    if not value:
+        return None
+    if "十" in value:
+        if value.count("十") != 1:
+            return None
+        tens, ones = value.split("十", 1)
+        if (tens and tens not in _CHINESE_NUMBER_DIGITS) or (ones and ones not in _CHINESE_NUMBER_DIGITS):
+            return None
+        return (_CHINESE_NUMBER_DIGITS[tens] if tens else 1) * 10 + (_CHINESE_NUMBER_DIGITS[ones] if ones else 0)
+    if len(value) == 1 and value in _CHINESE_NUMBER_DIGITS:
+        return _CHINESE_NUMBER_DIGITS[value]
+    return None
+
+
+def _partition_markers(titles: Sequence[str]) -> List[dict]:
+    """Extract only explicit season/part/cour markers from display titles."""
+    markers = []
+    patterns = (
+        ("season", re.compile(r"第\s*([0-9一二三四五六七八九十两零〇]+)\s*季")),
+        ("part", re.compile(r"第\s*([0-9一二三四五六七八九十两零〇]+)\s*(部分|部|篇|期)")),
+        ("season", re.compile(r"\bseason\s*0*(\d{1,2})\b", re.I)),
+        ("season", re.compile(r"\bs\s*0*(\d{1,2})\b", re.I)),
+        ("part", re.compile(r"\bpart\s*0*(\d{1,2})\b", re.I)),
+        ("cour", re.compile(r"\bcour\s*0*(\d{1,2})\b", re.I)),
+        ("season", re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+season\b", re.I)),
+    )
+    seen = set()
+    for title in titles:
+        normalized = unicodedata.normalize("NFKC", str(title or ""))
+        for kind, pattern in patterns:
+            for match in pattern.finditer(normalized):
+                token = match.group(1)
+                number = _partition_number(token)
+                if number is None or number <= 0:
+                    continue
+                marker = {"number": number, "kind": kind, "text": match.group(0), "title": str(title)}
+                key = (number, kind, marker["text"].casefold(), str(title))
+                if key not in seen:
+                    markers.append(marker)
+                    seen.add(key)
+    return markers
+
+
+def _episode_numbering_profile(subject: Optional[dict], cloud_node: dict, episode_rows: List[dict],
+                               videos: List[dict], *, ambiguous: bool, unmatched: bool) -> Tuple[dict, Optional[dict]]:
+    """Build a conservative, auditable map from Bangumi-local ep to global sort.
+
+    Bangumi's Episode schema defines ``ep`` as the episode number within the
+    subject (starting at 1) and ``sort`` as ordering in the original work:
+    https://raw.githubusercontent.com/bangumi/api/master/open-api/v0.yaml
+    """
+    parsed_keys = [parse_video_episode(video["name"]) for video in videos]
+    ordinary_numbers = sorted({number for parsed in parsed_keys
+                               if (number := _strict_positive_integer(parsed)) is not None})
+    title_values = subject_titles(subject) if subject is not None else []
+    cloud_name = str(cloud_node.get("name") or "")
+    marker_inputs = list(title_values)
+    if cloud_name:
+        marker_inputs.append(cloud_name)
+    markers = _partition_markers(marker_inputs)
+    marker_numbers = sorted({item["number"] for item in markers})
+
+    base = {
+        "mode": "global_sort",
+        "ep_to_sort": {},
+        "sort_to_ep": {},
+        "episode_ids": {},
+        "evidence": {
+            "source": BANGUMI_EPISODE_SCHEMA_URL,
+            "subject_titles": title_values,
+            "cloud_name": cloud_name or None,
+            "partition_markers": markers,
+            "parsed_episode_keys": sorted({str(key) for key in parsed_keys if key is not None},
+                                            key=episode_sort_key),
+        },
+        "reason": "no_safe_season_relative_mapping",
+    }
+
+    if subject is None:
+        base["reason"] = "subject_metadata_unavailable"
+        return base, None
+
+    count = len(episode_rows)
+    sort_values = [_strict_positive_integer(row.get("sort")) for row in episode_rows]
+    ep_values = [_strict_positive_integer(row.get("ep")) for row in episode_rows]
+    episode_ids_valid = all(row.get("episode_id") is not None for row in episode_rows)
+    metadata_complete = bool(
+        count > 0 and episode_ids_valid
+        and all(value is not None for value in sort_values)
+        and all(value is not None for value in ep_values)
+        and len(set(sort_values)) == count
+        and len(set(ep_values)) == count
+        and set(ep_values) == set(range(1, count + 1))
+    )
+    sort_start = min(sort_values) if sort_values and all(value is not None for value in sort_values) else None
+    sort_end = max(sort_values) if sort_values and all(value is not None for value in sort_values) else None
+    sort_sequence_contiguous = bool(
+        count > 0 and sort_start is not None and sort_start > 1
+        and all(value is not None for value in sort_values)
+        and len(set(sort_values)) == count
+        and sorted(sort_values) == list(range(sort_start, sort_start + count))
+    )
+    ep_sort_aligned = bool(
+        metadata_complete and sort_sequence_contiguous
+        and all(sort_values[index - 1] == sort_start + ep_values[index - 1] - 1
+                for index in range(count))
+    )
+    shifted_sort_candidate = bool(sort_start is not None and sort_start > 1)
+    base["evidence"].update({
+        "episode_count": count,
+        "ep_range": [1, count] if count else None,
+        "sort_range": [sort_start, sort_end] if sort_start is not None else None,
+        "sort_contiguous": sort_sequence_contiguous,
+        "ep_complete_1_to_n": bool(metadata_complete and set(ep_values) == set(range(1, count + 1))),
+        "ep_sort_aligned": ep_sort_aligned,
+    })
+    if not shifted_sort_candidate:
+        base["reason"] = "sort_not_shifted"
+        return base, None
+
+    def blocked(reason: str, *, issue: bool = True) -> Tuple[dict, Optional[dict]]:
+        value = dict(base)
+        value["mode"] = "blocked"
+        value["ep_to_sort"] = {}
+        value["sort_to_ep"] = {}
+        value["episode_ids"] = {}
+        value["reason"] = reason
+        coverage_issue = None
+        if issue:
+            coverage_issue = {
+                "stage": "episode_mapping",
+                "code": reason,
+                "message": "Episode numbering could not be resolved safely; automatic completeness decisions are disabled",
+                "subject_id": str(subject.get("subject_id") or "") or None,
+            }
+        return value, coverage_issue
+
+    if not metadata_complete or not ep_sort_aligned:
+        return blocked("episode_metadata_ep_sort_incomplete")
+
+    if len(marker_numbers) > 1:
+        return blocked("partition_title_conflict")
+
+    if ambiguous:
+        return blocked("ambiguous_subject_match", issue=False)
+    if cloud_node.get("incomplete"):
+        return blocked("cloud_directory_incomplete")
+
+    ep_to_sort = {}
+    sort_to_ep = {}
+    episode_ids = {}
+    for row in episode_rows:
+        ep = _strict_positive_integer(row.get("ep"))
+        sort = _strict_positive_integer(row.get("sort"))
+        ep_key_text = str(ep)
+        sort_key_text = str(sort)
+        ep_to_sort[ep_key_text] = sort_key_text
+        sort_to_ep[sort_key_text] = ep_key_text
+        episode_ids[sort_key_text] = row.get("episode_id")
+
+    ep_domain = set(range(1, count + 1))
+    sort_domain = set(range(sort_start, sort_start + count))
+    overlap = sorted(ep_domain.intersection(sort_domain))
+    base["evidence"].update({
+        "sort_domain_overlap": overlap,
+        "sort_domain": [sort_start, sort_start + count - 1],
+        "ep_domain": [1, count],
+        "partition_number": marker_numbers[0] if marker_numbers else None,
+    })
+    if overlap:
+        return blocked("episode_numbering_domain_overlap")
+
+    if unmatched and ordinary_numbers:
+        return blocked("unmatched_cloud_directory")
+
+    parsed_in_ep = {number for number in ordinary_numbers if number in ep_domain}
+    parsed_in_sort = {number for number in ordinary_numbers if number in sort_domain}
+    parsed_outside = set(ordinary_numbers) - ep_domain - sort_domain
+    base["evidence"]["parsed_ep_domain"] = sorted(parsed_in_ep)
+    base["evidence"]["parsed_sort_domain"] = sorted(parsed_in_sort)
+    base["evidence"]["parsed_outside_domains"] = sorted(parsed_outside)
+    if parsed_in_ep and parsed_in_sort:
+        return blocked("mixed_episode_numbering")
+    if parsed_outside:
+        return blocked("episode_number_outside_metadata_domains")
+
+    base["ep_to_sort"] = ep_to_sort
+    base["sort_to_ep"] = sort_to_ep
+    base["episode_ids"] = episode_ids
+    base["reason"] = None
+    if parsed_in_ep:
+        base["mode"] = "season_relative"
+        base["evidence"]["cloud_numbering"] = "bangumi_ep"
+    elif parsed_in_sort:
+        base["mode"] = "global_sort"
+        base["evidence"]["cloud_numbering"] = "bangumi_sort"
+    else:
+        base["mode"] = "metadata_alias"
+        base["evidence"]["cloud_numbering"] = "no_parsed_ordinary_video"
+    return base, None
+
+
 def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
                          episodes: Optional[List[dict]] = None, ambiguous: bool = False,
                          unmatched: bool = False, expected_known: bool = False,
@@ -1051,15 +1276,46 @@ def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
     extras = []
     episode_rows = [dict(item, present=[]) for item in (episodes or [])]
     by_key = {item["key"]: item for item in episode_rows}
+    episode_numbering, numbering_issue = _episode_numbering_profile(
+        subject, cloud_node, episode_rows, videos, ambiguous=ambiguous, unmatched=unmatched,
+    )
+    effective_coverage_issues = list(coverage_issues or [])
+    if numbering_issue is not None:
+        effective_coverage_issues.append(numbering_issue)
+    effective_coverage_unknown = bool(coverage_unknown or numbering_issue is not None)
     for video in videos:
         summary = _file_summary(video)
         parsed = parse_video_episode(video["name"])
-        if parsed is not None and parsed in by_key:
-            by_key[parsed]["present"].append(summary)
-            files_by_episode.setdefault(parsed, []).append(summary)
+        summary["parsed_episode_key"] = parsed
+        mapped_key = None
+        match_basis = None
+        if parsed is not None and episode_numbering["mode"] == "season_relative":
+            local_number = _strict_positive_integer(parsed)
+            if local_number is not None:
+                mapped_key = episode_numbering["ep_to_sort"].get(str(local_number))
+                match_basis = "bangumi_ep"
+        elif parsed is not None and episode_numbering["mode"] in ("global_sort", "metadata_alias"):
+            mapped_key = parsed
+            match_basis = "bangumi_sort"
+
+        if mapped_key is not None and mapped_key in by_key:
+            episode = by_key[mapped_key]
+            summary["matched_episode_key"] = _episode_label(mapped_key)
+            summary["matched_episode_id"] = episode.get("episode_id")
+            summary["episode_match_basis"] = match_basis
+            episode["present"].append(summary)
+            files_by_episode.setdefault(mapped_key, []).append(summary)
         else:
-            reason = "episode_not_in_bangumi" if parsed is not None else "unrecognized_episode_filename"
-            extras.append({**summary, "parsed_episode": parsed, "reason": reason})
+            if parsed is None:
+                reason = "unrecognized_episode_filename"
+            elif episode_numbering["mode"] == "blocked":
+                reason = "episode_numbering_blocked"
+            else:
+                reason = "episode_not_in_bangumi"
+            extra = {**summary, "parsed_episode": parsed, "reason": reason}
+            if episode_numbering["mode"] == "blocked":
+                extra["mapping_reason"] = episode_numbering.get("reason")
+            extras.append(extra)
 
     today = dt.date.today()
     # A collection row itself carries an unambiguous Bangumi subject id even when
@@ -1067,7 +1323,8 @@ def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
     # are confirmed absent from the inventory and can be safely seeded by the
     # downloader. Ambiguous subject/folder matches and missing episode metadata
     # never produce download candidates.
-    eligible_for_comparison = bool(subject is not None and expected_known and not ambiguous and not coverage_unknown)
+    eligible_for_comparison = bool(subject is not None and expected_known and not ambiguous
+                                   and not effective_coverage_unknown)
     missing = []
     expected_keys = [item["key"] for item in episode_rows]
     for item in episode_rows:
@@ -1124,7 +1381,7 @@ def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
     else:
         title = cloud_node["name"]
 
-    total_eps = len(episode_rows) if expected_known and not coverage_unknown else None
+    total_eps = len(episode_rows) if expected_known and not effective_coverage_unknown else None
     return {
         "name": title if subject is not None else cloud_node["name"],
         "cloud_name": cloud_node["name"] if subject is not None else None,
@@ -1137,8 +1394,9 @@ def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
         "matched": bool(subject is not None and not unmatched and not ambiguous),
         "ambiguous": bool(ambiguous),
         "unmatched": bool(unmatched),
-        "coverage_unknown": bool(coverage_unknown),
-        "coverage_issues": list(coverage_issues or []),
+        "coverage_unknown": effective_coverage_unknown,
+        "coverage_issues": effective_coverage_issues,
+        "episode_numbering": episode_numbering,
         "empty": bool(cloud_node.get("empty")) if cloud_node else True,
         "incomplete": bool(cloud_node.get("incomplete", False)) if cloud_node else False,
         "vids": [{"name": item["name"], "relative_path": item["path"], "path": item["path"]} for item in videos],
@@ -1154,7 +1412,7 @@ def show_node_from_cloud(cloud_node: dict, *, subject: Optional[dict] = None,
         "unknown_airdate_eps": unknown_airdate,
         "duplicate_eps": sorted(duplicates, key=_episode_label_sort_key),
         "episodes": episode_rows + list(extra_episode_rows_by_key.values()),
-        "expected_eps_count": len(expected_keys) if expected_known and not coverage_unknown else None,
+        "expected_eps_count": len(expected_keys) if expected_known and not effective_coverage_unknown else None,
         "present_eps_count": len(present),
         "missing_eps_count": len(missing),
         "extra_eps_count": len(extras),
@@ -1476,7 +1734,7 @@ def build_report(cfg: dict, subjects: Sequence[dict], episodes_by_subject: dict,
                 coverage_unknown_shows.append(show)
                 coverage_warnings.append({
                     "stage": "episode_mapping", "code": "coverage_unknown",
-                    "message": "Bangumi episode rows are retained, but automatic completeness decisions are disabled for this show",
+                    "message": "Episode records and files are retained, but automatic completeness decisions are disabled for this show",
                     "subject_id": show.get("subject_id"), "issues": show.get("coverage_issues", []),
                 })
     error_stages = {str(issue.get("stage", "")) for issue in errors}

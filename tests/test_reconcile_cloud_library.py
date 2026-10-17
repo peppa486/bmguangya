@@ -225,6 +225,46 @@ def make_verified_duplicate_pack_inventory(*, second_episode=False):
     return inventory
 
 
+def make_whole_pack_duplicate_inventory():
+    """Two numbered sibling packs with fully identical, hash-backed manifests."""
+    inventory = make_verified_duplicate_pack_inventory()
+    show_node = inventory["inventory_root"]["children"][0]["children"][0]
+    source_pack = next(child for child in show_node["children"] if child["name"] == "Disc 01")
+    source_pack["name"] = "Pack (2)"
+    source_video = next(child for child in source_pack["children"] if child["name"] == "01.mkv")
+    source_subtitle = next(child for child in source_pack["children"] if child["name"] == "01.ass")
+    source_subtitle.update({"size": 42, "gcid": "c" * 40})
+    source_extra = fnode("bonus.mp4", "source-bonus")
+    source_extra.update({"size": 300, "gcid": "d" * 40})
+    source_pack["children"].append(source_extra)
+
+    root_video = next(child for child in show_node["children"] if child["name"] == "EP01.mkv")
+    show_node["children"].remove(root_video)
+    root_video.update({"name": "01.mkv", "file_id": "peer-video", "size": 100, "gcid": "a" * 40})
+    peer_subtitle = fnode("01.ass", "peer-subtitle")
+    peer_subtitle.update({"size": 42, "gcid": "c" * 40})
+    peer_extra = fnode("bonus.mp4", "peer-bonus")
+    peer_extra.update({"size": 300, "gcid": "d" * 40})
+    peer_pack = dnode("Pack (1)", [root_video, peer_subtitle, peer_extra], file_id="peer-pack-id")
+    show_node["children"].append(peer_pack)
+
+    episode = inventory["tree"][0]["shows"][0]["episodes"][0]
+    source_path = SHOW_REL + "/Pack (2)/01.mkv"
+    peer_path = SHOW_REL + "/Pack (1)/01.mkv"
+    episode.update({
+        "file_id": source_video["file_id"],
+        "relative_path": source_path,
+        "file_name": "01.mkv",
+        "present_files": [
+            {"relative_path": source_path, "name": "01.mkv", "file_id": source_video["file_id"],
+             "size": 100, "gcid": "a" * 40},
+            {"relative_path": peer_path, "name": "01.mkv", "file_id": "peer-video",
+             "size": 100, "gcid": "a" * 40},
+        ],
+    })
+    return inventory
+
+
 def add_duplicate_review_name_collision(inventory):
     title_directory = dnode("准确标题", [fnode("Disc 01", "existing-review-item")],
                             file_id="review-title-dir")
@@ -600,6 +640,61 @@ class ReconcilePlanTests(unittest.TestCase):
                                                           SHOW_REL + "/Disc 01/02.mkv"}]
         self.assertTrue(all(row["state"] == "planned" for row in duplicate_rows))
         self.assertTrue(all(row["covered_by_action_id"] == action["action_id"] for row in duplicate_rows))
+
+    def test_identical_numbered_pack_manifest_proves_uncovered_extras_safe_to_fold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_whole_pack_duplicate_inventory()
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            cfg["collapse_verified_duplicate_directories"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        actions = [row for row in plan["actions"]
+                   if row.get("role") == "duplicate_content_directory"]
+        self.assertEqual(len(actions), 1)
+        action = actions[0]
+        self.assertEqual(action["source_relative_path"], SHOW_REL + "/Pack (2)")
+        self.assertEqual(action["kept_directory_relative_path"], SHOW_REL + "/Pack (1)")
+        self.assertEqual(action["kept_directory_id"], "peer-pack-id")
+        self.assertEqual(action["whole_pack_duplicate_proof"]["method"],
+                         "sibling_complete_gcid_size_manifest")
+        self.assertEqual(action["whole_pack_duplicate_proof"]["additional_video_count"], 1)
+        self.assertEqual(action["whole_pack_duplicate_proof"]["additional_file_count"], 1)
+        self.assertEqual(action["whole_pack_duplicate_proof"]["additional_video_relative_paths"],
+                         ["bonus.mp4"])
+        self.assertEqual({row["relative_path"] for row in action["kept_directory_manifest"]},
+                         {"01.mkv", "01.ass", "bonus.mp4"})
+        self.assertFalse(any(row.get("source_relative_path") == SHOW_REL + "/Pack (1)"
+                             and row.get("role") == "duplicate_content_directory"
+                             for row in plan["actions"]))
+
+    def test_whole_pack_proof_rejects_changed_shape_hash_or_missing_evidence(self):
+        mutations = ("extra_hash", "extra_size", "extra_shape", "extra_missing_gcid", "extra_missing_size")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                inventory = make_whole_pack_duplicate_inventory()
+                show_node = inventory["inventory_root"]["children"][0]["children"][0]
+                peer = next(child for child in show_node["children"] if child["name"] == "Pack (1)")
+                peer_extra = next(child for child in peer["children"] if child["name"] == "bonus.mp4")
+                if mutation == "extra_hash":
+                    peer_extra["gcid"] = "e" * 40
+                elif mutation == "extra_size":
+                    peer_extra["size"] = 301
+                elif mutation == "extra_shape":
+                    peer["children"].remove(peer_extra)
+                elif mutation == "extra_missing_gcid":
+                    peer_extra.pop("gcid")
+                else:
+                    peer_extra["size"] = 0
+                cfg = config(tmp)
+                cfg["organize_unassigned"] = True
+                cfg["collapse_verified_duplicate_directories"] = True
+                plan = rec.build_plan(inventory, cfg)
+
+                self.assertFalse(any(row.get("role") == "duplicate_content_directory"
+                                     for row in plan["actions"]))
+                self.assertTrue(any(row.get("role") == "duplicate_content_video"
+                                    for row in plan["actions"]))
 
     def test_keeper_unique_video_or_missing_identity_prevents_directory_collapse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1036,6 +1131,62 @@ class ReconcileExecutionTests(unittest.TestCase):
         self.assertFalse(any(write[0] == "move" and write[1] == abs_path(SHOW_REL)
                              and write[3] == "Disc 01" for write in client.writes))
 
+    def test_live_kept_pack_change_blocks_whole_pack_directory_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_whole_pack_duplicate_inventory()
+            client = MemoryAList(inventory["inventory_root"])
+            peer_path = abs_path(SHOW_REL + "/Pack (1)")
+            next(row for row in client.dirs[peer_path] if row["name"] == "bonus.mp4")["gcid"] = "e" * 40
+            report, code = self._run(tmp, inventory, client, apply=True,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 2)
+        action = next(row for row in report["actions"]
+                      if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(action["state"], "blocked")
+        self.assertEqual(action["blocked"]["code"], "directory_manifest_changed")
+        self.assertIn("live kept-peer subtree GCID changed", action["blocked"]["message"])
+        self.assertFalse(any(write[0] == "move" and write[1] == abs_path(SHOW_REL)
+                             and write[3] == "Pack (2)" for write in client.writes))
+
+    def test_pending_whole_pack_move_recovers_before_reading_peer_or_source_subtree(self):
+        class SourceAndPeerSubtreeUnavailable(MemoryAList):
+            unavailable_paths = set()
+
+            def list_all(self, path, *, refresh=True):
+                if path in self.unavailable_paths:
+                    raise rec.ReconcileError("subtree is no longer readable", code="missing_dir")
+                return super().list_all(path, refresh=refresh)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_whole_pack_duplicate_inventory()
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            cfg["collapse_verified_duplicate_directories"] = True
+            action = next(row for row in rec.build_plan(inventory, cfg)["actions"]
+                          if row.get("role") == "duplicate_content_directory")
+            client = SourceAndPeerSubtreeUnavailable(inventory["inventory_root"])
+            client.make_dir(abs_path("未标记"))
+            client.make_dir(abs_path("未标记/待核对-重复内容"))
+            client.make_dir(abs_path("未标记/待核对-重复内容/准确标题"))
+            client.move_file(action["source_dir"], action["target_dir"], action["original_name"])
+            client.unavailable_paths.update({action["source_path"], action["kept_directory_path"]})
+            writes_before_recovery = list(client.writes)
+            report_path = Path(tmp) / "reconcile.json"
+            pending = dict(action, state="pending", pending_step="organize_move",
+                           current_name=action["original_name"], pending_since=NOW.isoformat(), steps=[])
+            report_path.write_text(json.dumps({"actions": [pending]}), encoding="utf-8")
+
+            report, code = self._run(tmp, inventory, client, apply=True, report=report_path,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 0)
+        recovered = next(row for row in report["actions"]
+                         if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(recovered["state"], "done")
+        self.assertTrue(recovered["recovered_from_pending"])
+        self.assertEqual(client.writes, writes_before_recovery)
+
     def test_pending_collapsed_move_recovers_from_target_id_without_source_manifest(self):
         class SourceSubtreeUnavailable(MemoryAList):
             unavailable_paths = set()
@@ -1220,7 +1371,7 @@ class AListClientTests(unittest.TestCase):
             rows = rec.AListClient(cfg, session=session).list_all(ROOT, refresh=True)
             self.assertEqual(len(rows), 3)
             self.assertEqual([call[1]["json"]["page"] for call in session.calls], [1, 2])
-            self.assertTrue(all(call[1]["json"]["refresh"] is True for call in session.calls))
+            self.assertEqual([call[1]["json"]["refresh"] for call in session.calls], [True, False])
 
             bad = self.Session([{"code": 500, "message": "denied"}])
             with self.assertRaisesRegex(rec.ReconcileError, "business code was not 200"):

@@ -590,6 +590,8 @@ def get_remote_episode_file_index(
     client: GuangYaClient,
     folder_id: str,
     episode_keys: List[str],
+    *,
+    inventory_show: Optional[dict] = None,
 ) -> Dict[str, List[str]]:
     """Freshly list a destination folder and map matching episode videos to names.
 
@@ -618,7 +620,9 @@ def get_remote_episode_file_index(
             raise RuntimeError("GuangYa target directory response has invalid fileName")
         if Path(file_name).suffix.lower() not in VIDEO_SUFFIXES:
             continue
-        for key in _episode_keys_from_remote_video_name(file_name) & expected:
+        parsed_keys = _episode_keys_from_remote_video_name(file_name)
+        comparable_keys = _remote_file_episode_keys(parsed_keys, inventory_show)
+        for key in comparable_keys & expected:
             existing.setdefault(key, []).append(file_name)
     return existing
 
@@ -710,7 +714,7 @@ def choose_single_video_file_index(bt_info: dict, source_title: str, target_name
     if not subfiles:
         return None
 
-    target_label = Path(target_name).stem
+    target_label = canonical_episode_key(Path(target_name).stem)
     video_files = []
     for sub in subfiles:
         name = sub.get("fileName") or ""
@@ -739,6 +743,7 @@ def choose_single_video_file_index(bt_info: dict, source_title: str, target_name
                 tail_match = re.search(r"(?:^|[\s._-])(\d{1,3})(?=\.[^.]+$)", name)
                 if tail_match:
                     label = f"{int(tail_match.group(1)):02d}"
+        label = canonical_episode_key(label) if label else ""
         if label and label == target_label:
             matching.append(sub)
 
@@ -780,7 +785,9 @@ def choose_exact_batch_candidate(rss_items: List[dict], filters: dict, missing: 
     narrowed to the exact missing keys before submission.
     """
     if (not isinstance(inventory_show, dict) or inventory_show.get("ambiguous")
-            or inventory_show.get("coverage_unknown")):
+            or inventory_show.get("coverage_unknown")
+            or not _episode_numbering_is_usable(inventory_show)
+            or _has_nonidentity_episode_numbering(inventory_show)):
         return None
 
     def numbers_for(items):
@@ -1087,9 +1094,154 @@ def map_unlabelled_single_to_only_episode(item: dict, inventory_show: dict) -> s
 
 def candidate_inventory_episode_key(item: dict, inventory_show: dict) -> str:
     key = inventory_episode_key(item)
-    if key:
+    numbering = _episode_numbering_info(inventory_show)
+    if numbering is None:
+        if key:
+            return key
+        return map_unlabelled_single_to_only_episode(item, inventory_show)
+    if not _episode_numbering_is_usable(inventory_show):
+        return ""
+    if not key:
+        return map_unlabelled_single_to_only_episode(item, inventory_show)
+    number = _ordinary_episode_number(key)
+    if number is None:
+        # Specials are not part of the ordinary ep/sort numbering map.
         return key
-    return map_unlabelled_single_to_only_episode(item, inventory_show)
+    ep_to_sort = numbering["ep_to_sort"]
+    sort_domain = numbering["sort_domain"]
+    if numbering["mode"] == "global_sort" and not ep_to_sort:
+        # Standard first-season inventories use Bangumi sort numbers directly
+        # and intentionally have no ep-to-sort alias map.
+        return key
+    mapped = ep_to_sort.get(number)
+    in_sort_domain = number in sort_domain
+    if in_sort_domain and mapped is not None and mapped != number:
+        # The same bare EPn could name two different Bangumi episodes across
+        # the season-relative and global domains. Do not guess which was meant.
+        return ""
+    if in_sort_domain:
+        return canonical_episode_key(str(number))
+    if mapped is not None:
+        return canonical_episode_key(str(mapped))
+    return ""
+
+
+_EPISODE_NUMBERING_MODES = {"season_relative", "global_sort", "metadata_alias"}
+
+
+def _ordinary_episode_number(value: Any) -> Optional[int]:
+    key = canonical_episode_key(str(value or ""))
+    match = re.fullmatch(r"EP(\d{1,3})", key)
+    return int(match.group(1)) if match else None
+
+
+def _parse_number_map(value: Any) -> Tuple[Dict[int, int], bool]:
+    if value is None:
+        return {}, True
+    if not isinstance(value, dict):
+        return {}, False
+    parsed: Dict[int, int] = {}
+    for raw_key, raw_value in value.items():
+        if isinstance(raw_value, bool):
+            return {}, False
+        key = _ordinary_episode_number(str(raw_key))
+        if key is None:
+            try:
+                key = int(str(raw_key))
+            except (TypeError, ValueError):
+                return {}, False
+        if key < 0 or key > 999:
+            return {}, False
+        if isinstance(raw_value, int):
+            mapped = raw_value
+        else:
+            try:
+                mapped = int(str(raw_value))
+            except (TypeError, ValueError):
+                return {}, False
+        if mapped < 0 or mapped > 999:
+            return {}, False
+        if key in parsed and parsed[key] != mapped:
+            return {}, False
+        parsed[key] = mapped
+    return parsed, True
+
+
+def _episode_numbering_info(show: Optional[dict]) -> Optional[dict]:
+    """Return normalized numbering metadata, or None for legacy inventories."""
+    if not isinstance(show, dict) or "episode_numbering" not in show:
+        return None
+    numbering = show.get("episode_numbering")
+    if not isinstance(numbering, dict):
+        return {"mode": "invalid", "ep_to_sort": {}, "sort_to_ep": {},
+                "sort_domain": set(), "valid": False}
+    mode = str(numbering.get("mode") or "").strip().lower()
+    ep_to_sort, ep_valid = _parse_number_map(numbering.get("ep_to_sort"))
+    sort_to_ep, sort_valid = _parse_number_map(numbering.get("sort_to_ep"))
+    valid = mode in _EPISODE_NUMBERING_MODES and ep_valid and sort_valid
+    if valid and bool(ep_to_sort) != bool(sort_to_ep):
+        valid = False
+    if valid and mode != "global_sort" and not ep_to_sort:
+        valid = False
+    if valid and ep_to_sort and sort_to_ep:
+        valid = (all(sort_to_ep.get(sort) == ep for ep, sort in ep_to_sort.items())
+                 and all(ep_to_sort.get(ep) == sort for sort, ep in sort_to_ep.items()))
+    sort_domain = set(sort_to_ep)
+    if not sort_domain:
+        sort_domain = set(ep_to_sort.values())
+    return {"mode": mode, "ep_to_sort": ep_to_sort, "sort_to_ep": sort_to_ep,
+            "sort_domain": sort_domain, "valid": valid}
+
+
+def _episode_numbering_is_usable(show: Optional[dict]) -> bool:
+    numbering = _episode_numbering_info(show)
+    return numbering is None or bool(numbering.get("valid"))
+
+
+def _has_nonidentity_episode_numbering(show: Optional[dict]) -> bool:
+    numbering = _episode_numbering_info(show)
+    return bool(numbering and numbering.get("valid")
+                and any(ep != sort for ep, sort in numbering["ep_to_sort"].items()))
+
+
+def _remote_file_episode_keys(parsed_keys: set, show: Optional[dict]) -> set:
+    """Map cloud filenames to possible Bangumi sort keys for fresh de-duplication.
+
+    In a season-relative tree EP03 is the local spelling for its mapped sort
+    key. Global-sort inventories keep the literal filename. Metadata aliases
+    are treated as both possible spellings so a fresh target check fails safe.
+    """
+    numbering = _episode_numbering_info(show)
+    if numbering is None or not numbering.get("valid"):
+        return set(parsed_keys)
+    result = set()
+    for key in parsed_keys:
+        number = _ordinary_episode_number(key)
+        if number is None:
+            result.add(key)
+            continue
+        mapped = numbering["ep_to_sort"].get(number)
+        if numbering["mode"] == "season_relative":
+            if mapped is not None:
+                result.add(canonical_episode_key(str(mapped)))
+                if number in numbering["sort_domain"] and mapped != number:
+                    result.add(canonical_episode_key(str(number)))
+            elif number in numbering["sort_domain"]:
+                result.add(canonical_episode_key(str(number)))
+            else:
+                result.add(canonical_episode_key(str(number)))
+        elif numbering["mode"] == "metadata_alias":
+            result.add(canonical_episode_key(str(number)))
+            if mapped is not None:
+                result.add(canonical_episode_key(str(mapped)))
+        else:
+            # Global-sort describes the current inventory, not files that may
+            # have appeared since it was scanned. Check both plausible labels
+            # against a fresh directory listing to avoid duplicate downloads.
+            result.add(canonical_episode_key(str(number)))
+            if mapped is not None:
+                result.add(canonical_episode_key(str(mapped)))
+    return result
 
 
 def validate_inventory_show(show: Optional[dict]) -> bool:
@@ -1107,6 +1259,8 @@ def validate_inventory_show(show: Optional[dict]) -> bool:
 
 def is_safe_inventory_subject(show: Optional[dict]) -> bool:
     """Allow existing matches or an unambiguous Bangumi-only new target."""
+    if not _episode_numbering_is_usable(show):
+        return False
     if validate_inventory_show(show):
         return True
     if (not isinstance(show, dict) or not show.get("subject_id") or show.get("ambiguous")
@@ -1604,8 +1758,11 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
 
         shows = inventory_by_subject.get(subject_id, [])
         if len(shows) != 1 or not is_safe_inventory_subject(shows[0]):
+            reason = "inventory_episode_numbering_unusable" if (
+                len(shows) == 1 and not _episode_numbering_is_usable(shows[0])
+            ) else "inventory_subject_missing_or_ambiguous"
             unresolved.append({"subject_id": subject_id, "title": display,
-                               "reason": "inventory_subject_missing_or_ambiguous"})
+                               "reason": reason})
             continue
         inventory_show = shows[0]
         if subject_id in invalid_subject_overrides:
@@ -1656,11 +1813,26 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
             if not has_active_episode_task(state, subject_id, key)
         }
         batch_missing = limit_batch_missing_episodes(batch_missing, row, cfg)
-        batch_candidate = choose_exact_batch_candidate(
-            rss_items, cfg.get("filters", {}), batch_missing, inventory_show, row, related,
-            locked_subgroup=state["subject_subgroups"].get(subject_id),
-            max_episode_count=max_batch_episode_span,
-        ) if max_batch_episode_span >= 2 else None
+        batch_candidate = None
+        if max_batch_episode_span >= 2:
+            if _has_nonidentity_episode_numbering(inventory_show):
+                has_batch_source = any(
+                    (span := extract_episode_span(str(item.get("title") or "")))
+                    and span[0] != span[1]
+                    and score_item(str(item.get("title") or ""), cfg.get("filters", {}),
+                                   locked_subgroup=state["subject_subgroups"].get(subject_id))[0]
+                    and item_matches_subject_partition(row, str(item.get("title") or ""), related)
+                    for item in rss_items
+                )
+                if has_batch_source:
+                    skipped.append({"subject_id": subject_id, "episode_key": "BATCH",
+                                    "reason": "batch_episode_numbering_translation_unsupported"})
+            else:
+                batch_candidate = choose_exact_batch_candidate(
+                    rss_items, cfg.get("filters", {}), batch_missing, inventory_show, row, related,
+                    locked_subgroup=state["subject_subgroups"].get(subject_id),
+                    max_episode_count=max_batch_episode_span,
+                )
         if batch_candidate:
             guid = str(batch_candidate.get("guid") or "")
             torrent_url = batch_candidate.get("torrent_url") or batch_candidate.get("link") or batch_candidate.get("url")
@@ -1675,8 +1847,15 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 skipped.append({"subject_id": subject_id, "episode_key": "BATCH",
                                 "reason": "batch_source_already_attempted_or_incomplete"})
         for item in chosen:
+            source_episode_key = inventory_episode_key(item)
             episode_key = candidate_inventory_episode_key(item, inventory_show)
-            if not episode_key or episode_key not in missing:
+            if not episode_key:
+                if source_episode_key and _episode_numbering_info(inventory_show) is not None:
+                    skipped.append({"subject_id": subject_id,
+                                    "episode_key": source_episode_key,
+                                    "reason": "episode_numbering_unmapped_or_ambiguous"})
+                continue
+            if episode_key not in missing:
                 continue
             if not is_single_episode_candidate(item.get("title") or ""):
                 continue
@@ -1701,6 +1880,7 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
         processed_subjects.add(subject_id)
 
         for episode_key, item, torrent_url, guid, is_batch, episode_keys in eligible:
+            source_episode_key = inventory_episode_key(item)
             if len(submitted) >= run_budget or len(planned) >= run_budget:
                 break
             if dry_run:
@@ -1743,7 +1923,9 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                     skipped.append({"subject_id": subject_id, "episode_key": episode_key,
                                     "reason": "unlabelled_single_source_is_not_one_video"})
                     continue
-                indexes = choose_single_video_file_index(bt_info, item.get("title") or "", episode_key)
+                indexes = choose_single_video_file_index(
+                    bt_info, item.get("title") or "", source_episode_key or episode_key,
+                )
                 if indexes == []:
                     skipped.append({"subject_id": subject_id, "episode_key": episode_key,
                                     "reason": "ambiguous_multi_file_torrent"})
@@ -1765,7 +1947,9 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 file_name = f"{episode_key}{suffix}"
             category_id = ensure_child_dir(client, root_id, category_dir, children_cache)
             folder_id = ensure_child_dir(client, category_id, show_dir, children_cache)
-            existing_episode_files = get_remote_episode_file_index(client, folder_id, episode_keys)
+            existing_episode_files = get_remote_episode_file_index(
+                client, folder_id, episode_keys, inventory_show=inventory_show,
+            )
             if existing_episode_files:
                 skipped.append({
                     "subject_id": subject_id,

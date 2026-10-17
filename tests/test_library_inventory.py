@@ -94,6 +94,39 @@ def standard_subject(subject_id, title, collection_type=3):
             "subject": {"id": int(subject_id), "name": title, "name_cn": title}}
 
 
+def shifted_episode_rows(subject_id, sort_start, count, *, missing_ep_at=None):
+    rows = []
+    for ep in range(1, count + 1):
+        rows.append({
+            "id": 1000000 + int(subject_id) * 100 + ep,
+            "subject_id": int(subject_id),
+            "type": 0,
+            "sort": sort_start + ep - 1,
+            "ep": None if ep == missing_ep_at else ep,
+            "name": "Episode {}".format(ep),
+            "airdate": "2020-01-01",
+        })
+    return rows
+
+
+def build_numbering_show(title, subject_id, raw_episodes, filenames, *, path=None,
+                         ambiguous=False, unmatched=False, incomplete=False):
+    subject = standard_subject(subject_id, title)
+    cloud_path = path if path is not None else "在看/" + title
+    cloud = dir_node(title, cloud_path, [
+        file_node(name, cloud_path + "/" + name, file_id="file-{}".format(index))
+        for index, name in enumerate(filenames, start=1)
+    ])
+    cloud["incomplete"] = incomplete
+    rows = inv.episode_records(raw_episodes, str(subject_id), today=date(2026, 10, 17))
+    issues = [row["mapping_issue"] for row in rows if row.get("mapping_issue")]
+    return inv.show_node_from_cloud(
+        cloud, subject=subject, episodes=rows, expected_known=not bool(issues),
+        ambiguous=ambiguous, unmatched=unmatched, coverage_unknown=bool(issues),
+        coverage_issues=issues,
+    )
+
+
 def make_alist_tree():
     root = "/guangya/Anime"
     return FakeAlistTree({
@@ -533,6 +566,200 @@ class EpisodeSemanticsTests(unittest.TestCase):
         selected, details = inv.match_subjects(duplicate, [dir_node("相同标题", "在看/相同标题")])
         self.assertEqual(selected, {})
         self.assertEqual(details["ambiguous_subject_ids"], {"3", "4"})
+
+    def test_bangumi_ep_to_sort_mapping_matches_season_relative_files(self):
+        cases = [
+            ("398951", "更衣人偶坠入爱河 第二季", 13, 12, 12),
+            ("498378", "间谍过家家 第三季", 38, 13, 13),
+            ("665390", "冰之城墙 第二季", 15, 12, 2),
+        ]
+        for subject_id, title, sort_start, count, present_count in cases:
+            with self.subTest(title=title):
+                rows = shifted_episode_rows(subject_id, sort_start, count)
+                files = ["EP{:02d}.mp4".format(ep) for ep in range(1, present_count + 1)]
+                show = build_numbering_show(title, subject_id, rows, files)
+                numbering = show["episode_numbering"]
+
+                self.assertEqual(numbering["mode"], "season_relative")
+                self.assertEqual(numbering["reason"], None)
+                self.assertEqual(numbering["ep_to_sort"]["1"], str(sort_start))
+                self.assertEqual(numbering["sort_to_ep"][str(sort_start)], "1")
+                self.assertEqual(numbering["episode_ids"][str(sort_start)], rows[0]["id"])
+                self.assertEqual(len(numbering["ep_to_sort"]), count)
+                self.assertEqual(
+                    show["present_eps"],
+                    ["EP{:02d}".format(sort_start + ep - 1) for ep in range(1, present_count + 1)],
+                )
+                self.assertEqual(
+                    show["missing_eps"],
+                    ["EP{:02d}".format(sort_start + ep - 1)
+                     for ep in range(present_count + 1, count + 1)],
+                )
+                self.assertEqual(show["extra_eps"], [])
+                mapped_episode = next(
+                    episode for episode in show["episodes"]
+                    if episode.get("episode_id") == rows[0]["id"]
+                )
+                self.assertEqual(mapped_episode["sort"], sort_start)
+                self.assertEqual(mapped_episode["ep"], 1)
+                self.assertEqual(mapped_episode["present_files"][0]["parsed_episode_key"], "1")
+                self.assertEqual(mapped_episode["present_files"][0]["matched_episode_key"],
+                                 "EP{:02d}".format(sort_start))
+                self.assertEqual(mapped_episode["present_files"][0]["matched_episode_id"], rows[0]["id"])
+
+    def test_empty_new_target_exposes_metadata_alias_without_changing_coverage(self):
+        subject_id = "7001"
+        title = "新番 第二季"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        show = build_numbering_show(title, subject_id, rows, [], path=None, unmatched=True)
+        numbering = show["episode_numbering"]
+
+        self.assertEqual(numbering["mode"], "metadata_alias")
+        self.assertEqual(numbering["ep_to_sort"]["3"], "15")
+        self.assertEqual(numbering["sort_to_ep"]["15"], "3")
+        self.assertEqual(numbering["episode_ids"]["15"], rows[2]["id"])
+        self.assertFalse(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], ["EP{:02d}".format(i) for i in range(13, 25)])
+
+    def test_global_sort_files_remain_literal_while_mapping_is_available_for_sources(self):
+        subject_id = "7002"
+        title = "新番 Season 2"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        show = build_numbering_show(title, subject_id, rows, ["EP13.mkv", "EP14.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "global_sort")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"]["3"], "15")
+        self.assertEqual(show["present_eps"], ["EP13", "EP14"])
+        self.assertEqual(show["episodes"][0]["present_files"][0]["parsed_episode_key"], "13")
+        self.assertEqual(show["episodes"][0]["present_files"][0]["episode_match_basis"], "bangumi_sort")
+        self.assertFalse(show["coverage_unknown"])
+
+    def test_overlapping_ep_and_sort_domains_block_mapping_and_missing_candidates(self):
+        subject_id = "7003"
+        title = "间谍过家家 第2部分"
+        rows = shifted_episode_rows(subject_id, 13, 13)
+        files = ["EP{:02d}.mkv".format(ep) for ep in range(1, 13)]
+        show = build_numbering_show(title, subject_id, rows, files)
+
+        self.assertEqual(show["episode_numbering"]["mode"], "blocked")
+        self.assertEqual(show["episode_numbering"]["reason"], "episode_numbering_domain_overlap")
+        self.assertEqual(show["episode_numbering"]["evidence"]["sort_domain_overlap"], [13])
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"], {})
+        self.assertTrue(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], [])
+        self.assertEqual(len(show["episodes"]), len(rows) + len(files))
+        self.assertEqual([row["parsed_episode_key"] for row in show["extra_eps"]],
+                         [str(ep) for ep in range(1, 13)])
+
+    def test_mixed_local_and_global_cloud_numbering_blocks_coverage(self):
+        subject_id = "7004"
+        title = "新番 第2季"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        show = build_numbering_show(title, subject_id, rows, ["EP01.mkv", "EP13.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "blocked")
+        self.assertEqual(show["episode_numbering"]["reason"], "mixed_episode_numbering")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"], {})
+        self.assertTrue(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], [])
+        self.assertEqual([row["name"] for row in show["extra_eps"]], ["EP01.mkv", "EP13.mkv"])
+
+    def test_shifted_metadata_without_partition_title_uses_bangumi_mapping(self):
+        subject_id = "7005"
+        title = "新番"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        show = build_numbering_show(title, subject_id, rows, ["EP01.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "season_relative")
+        self.assertIsNone(show["episode_numbering"]["reason"])
+        self.assertEqual(show["episode_numbering"]["evidence"]["partition_number"], None)
+        self.assertFalse(show["coverage_unknown"])
+        self.assertEqual(show["present_eps"], ["EP13"])
+        self.assertEqual(show["missing_eps"], ["EP{:02d}".format(ep) for ep in range(14, 25)])
+        self.assertEqual(show["extra_eps"], [])
+
+    def test_single_theatrical_subject_without_season_marker_uses_metadata_mapping(self):
+        subject_id = "7010"
+        rows = shifted_episode_rows(subject_id, 4, 1)
+        show = build_numbering_show("新剧场版：最终篇", subject_id, rows, ["EP01.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "season_relative")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"], {"1": "4"})
+        self.assertEqual(show["episode_numbering"]["sort_to_ep"], {"4": "1"})
+        self.assertIsNone(show["episode_numbering"]["evidence"]["partition_number"])
+        self.assertEqual(show["present_eps"], ["EP04"])
+        self.assertEqual(show["missing_eps"], [])
+        self.assertFalse(show["coverage_unknown"])
+
+    def test_unmarked_continuous_story_arc_uses_metadata_mapping(self):
+        subject_id = "7011"
+        rows = shifted_episode_rows(subject_id, 25, 12)
+        show = build_numbering_show("咒术回战 怀玉·玉折", subject_id, rows,
+                                    ["EP{:02d}.mkv".format(ep) for ep in range(1, 13)])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "season_relative")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"]["1"], "25")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"]["12"], "36")
+        self.assertEqual(show["present_eps"], ["EP{:02d}".format(ep) for ep in range(25, 37)])
+        self.assertEqual(show["missing_eps"], [])
+        self.assertFalse(show["coverage_unknown"])
+
+    def test_first_season_marker_does_not_override_complete_metadata_mapping(self):
+        subject_id = "7012"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        show = build_numbering_show("新番 第一季", subject_id, rows, ["EP01.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "season_relative")
+        self.assertEqual(show["episode_numbering"]["evidence"]["partition_number"], 1)
+        self.assertEqual(show["present_eps"], ["EP13"])
+        self.assertFalse(show["coverage_unknown"])
+
+    def test_conflicting_partition_markers_still_block_numbering(self):
+        subject_id = "7013"
+        subject = standard_subject(subject_id, "新番 第二季")
+        subject["subject"]["name"] = "New Show Season 3"
+        rows = shifted_episode_rows(subject_id, 13, 12)
+        episode_rows = inv.episode_records(rows, subject_id, today=date(2026, 10, 17))
+        cloud = dir_node("新番 第二季", "在看/新番 第二季", [
+            file_node("EP01.mkv", "在看/新番 第二季/EP01.mkv", file_id="file-1"),
+        ])
+        show = inv.show_node_from_cloud(
+            cloud, subject=subject, episodes=episode_rows, expected_known=True,
+        )
+
+        self.assertEqual(show["episode_numbering"]["mode"], "blocked")
+        self.assertEqual(show["episode_numbering"]["reason"], "partition_title_conflict")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"], {})
+        self.assertTrue(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], [])
+
+    def test_missing_local_ep_metadata_fails_closed_and_preserves_rows_and_issues(self):
+        subject_id = "7006"
+        title = "新番 第2季"
+        rows = shifted_episode_rows(subject_id, 13, 3, missing_ep_at=2)
+        show = build_numbering_show(title, subject_id, rows, ["EP01.mkv"])
+
+        self.assertEqual(show["episode_numbering"]["mode"], "blocked")
+        self.assertEqual(show["episode_numbering"]["reason"], "episode_metadata_ep_sort_incomplete")
+        self.assertEqual(show["episode_numbering"]["ep_to_sort"], {})
+        self.assertTrue(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], [])
+        retained = next(row for row in show["episodes"] if row.get("episode_id") == rows[1]["id"])
+        self.assertIsNone(retained["ep"])
+        self.assertEqual(show["extra_eps"][0]["name"], "EP01.mkv")
+
+    def test_numbering_issue_is_added_without_replacing_metadata_issue(self):
+        subject_id = "7007"
+        title = "新番 第2季"
+        rows = shifted_episode_rows(subject_id, 13, 3)
+        rows[1]["sort"] = rows[0]["sort"]
+        show = build_numbering_show(title, subject_id, rows, ["EP01.mkv"])
+
+        codes = {issue["code"] for issue in show["coverage_issues"]}
+        self.assertIn("duplicate_episode_number", codes)
+        self.assertIn("episode_metadata_ep_sort_incomplete", codes)
+        self.assertTrue(show["coverage_unknown"])
+        self.assertEqual(show["missing_eps"], [])
 
     def test_inventory_tree_keeps_empty_dirs_future_eps_and_exact_missing_eps(self):
         cfg = config()

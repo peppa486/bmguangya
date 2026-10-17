@@ -397,6 +397,19 @@ def build_show_plan(inventory: dict[str, Any], config_data: dict[str, Any]) -> t
                 continue
             if show.get("coverage_unknown") is True:
                 unresolved.append({"subject": title, "episode": "-", "reason": "bangumi_episode_coverage_unknown"})
+                planned.append({
+                    "category": category,
+                    "title": title,
+                    "subject_id": None,
+                    "inventory_subject_id": raw_subject_id if valid_subject_id else None,
+                    "source_path": source_text,
+                    "local_show": target_prefix,
+                    "episodes": [],
+                    "nfo_title": None,
+                    "skip_apply": True,
+                    "cleanup_safe": False,
+                })
+                continue
             if show.get("incomplete") is True:
                 unresolved.append({"subject": title, "episode": "-", "reason": "incomplete_show_inventory"})
 

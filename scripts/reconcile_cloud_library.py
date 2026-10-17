@@ -765,6 +765,111 @@ def _directory_manifest_from_inventory(node: dict) -> Optional[List[dict]]:
     return manifest if manifest else None
 
 
+def _directory_content_signature(manifest: Sequence[dict]) -> Optional[Tuple[Tuple[Any, ...], ...]]:
+    """Return path/type/content evidence only when every file is hash-backed."""
+    if not isinstance(manifest, (list, tuple)) or not manifest:
+        return None
+    signature = []
+    seen_paths = set()
+    for row in manifest:
+        if not isinstance(row, dict):
+            return None
+        relative = row.get("relative_path")
+        kind = row.get("type")
+        if not isinstance(relative, str) or kind not in ("directory", "file"):
+            return None
+        try:
+            _clean_relative_path(relative, field="duplicate pack manifest path")
+        except ReconcileError:
+            return None
+        if relative in seen_paths:
+            return None
+        seen_paths.add(relative)
+        if kind == "file":
+            gcid = _normalize_gcid(row.get("gcid"))
+            size = _positive_size(row.get("size"))
+            if gcid is None or size is None:
+                return None
+        else:
+            gcid = size = None
+        signature.append((relative, kind, gcid, size))
+    return tuple(sorted(signature, key=lambda row: (row[0].casefold(), row[0], row[1])))
+
+
+def _duplicate_pack_basename(name: Any) -> Optional[str]:
+    if not isinstance(name, str) or not name:
+        return None
+    match = re.fullmatch(r"(.+?)\s*\(\d+\)", name)
+    return match.group(1) if match else name
+
+
+def _verified_duplicate_pack_peer(inventory: dict, source_relative: str,
+                                  source_manifest: Sequence[dict],
+                                  covered_videos: Sequence[dict]) -> Optional[dict]:
+    """Prove a sibling numbered pack is the keeper of this complete identical pack."""
+    root = inventory["inventory_root"]
+    try:
+        source_parts = _clean_relative_path(source_relative, field="duplicate pack source")
+    except ReconcileError:
+        return None
+    if len(source_parts) < 2:
+        return None
+    parent_relative = "/".join(source_parts[:-1])
+    parent = _node_by_relative_path(root, parent_relative)
+    if parent is None or not _is_dir(parent):
+        return None
+    basename = _duplicate_pack_basename(source_parts[-1])
+    source_signature = _directory_content_signature(source_manifest)
+    if basename is None or source_signature is None or not covered_videos:
+        return None
+    source_entries = {row[0]: row for row in source_signature}
+
+    matches = []
+    for peer_node in parent.get("children", []):
+        if (not _is_dir(peer_node) or peer_node.get("name") == source_parts[-1]
+                or _duplicate_pack_basename(peer_node.get("name")) != basename):
+            continue
+        peer_id = _file_id(peer_node)
+        peer_manifest = _directory_manifest_from_inventory(peer_node) if peer_id else None
+        peer_signature = _directory_content_signature(peer_manifest or [])
+        if peer_manifest is None or peer_signature != source_signature:
+            continue
+        peer_relative = parent_relative + "/" + peer_node["name"]
+        peer_parts = _clean_relative_path(peer_relative, field="duplicate pack keeper")
+        keeper_paths_match = True
+        for action in covered_videos:
+            try:
+                video_parts = _clean_relative_path(action.get("source_relative_path"),
+                                                   field="duplicate pack video source")
+                kept_parts = _clean_relative_path(action.get("kept_relative_path"),
+                                                  field="duplicate pack video keeper")
+            except ReconcileError:
+                keeper_paths_match = False
+                break
+            if (len(video_parts) <= len(source_parts)
+                    or video_parts[:len(source_parts)] != source_parts):
+                keeper_paths_match = False
+                break
+            relative_file = video_parts[len(source_parts):]
+            expected_keeper = peer_parts + relative_file
+            source_entry = source_entries.get("/".join(relative_file))
+            if (kept_parts != expected_keeper or source_entry is None
+                    or source_entry[1] != "file"
+                    or source_entry[2] != _normalize_gcid(action.get("content_gcid"))
+                    or source_entry[3] != _positive_size(action.get("content_size"))):
+                keeper_paths_match = False
+                break
+        if keeper_paths_match:
+            matches.append({
+                "relative_path": peer_relative,
+                "path": None,
+                "file_id": peer_id,
+                "manifest": peer_manifest,
+                "signature": peer_signature,
+            })
+    return matches[0] if len(matches) == 1 else None
+
+
 def _live_directory_manifest(client: "AListClient", directory_path: str) -> List[dict]:
     """Read a fresh recursive manifest, failing closed on any incomplete listing."""
     manifest: List[dict] = []
@@ -825,32 +930,64 @@ def _live_directory_manifest(client: "AListClient", directory_path: str) -> List
     return manifest
 
 
-def _verify_live_directory_manifest(client: "AListClient", action: dict,
-                                    current_name: str) -> Tuple[bool, str, str]:
-    expected = action.get("directory_manifest")
+def _verify_live_manifest_at(client: "AListClient", directory_path: str,
+                             expected: Any, *, label: str) -> Tuple[bool, str, str]:
     if not isinstance(expected, list):
         return False, "directory_manifest_invalid", "planned directory manifest is missing or invalid"
-    source_path = action["source_dir"].rstrip("/") + "/" + current_name
     try:
-        live = _live_directory_manifest(client, source_path)
+        live = _live_directory_manifest(client, directory_path)
     except ReconcileError as exc:
         return False, exc.code, str(exc)
     if len(live) != len(expected):
-        return False, "directory_manifest_changed", "live subtree entry count differs from the planned manifest"
+        return False, "directory_manifest_changed", "{} entry count differs from the planned manifest".format(label)
     expected_by_path = {row.get("relative_path"): row for row in expected if isinstance(row, dict)}
     live_by_path = {row["relative_path"]: row for row in live}
     if len(expected_by_path) != len(expected) or set(expected_by_path) != set(live_by_path):
-        return False, "directory_manifest_changed", "live subtree paths differ from the planned manifest"
+        return False, "directory_manifest_changed", "{} paths differ from the planned manifest".format(label)
     for relative, planned in expected_by_path.items():
         current = live_by_path[relative]
         for key in ("type", "file_id", "size"):
             if planned.get(key) != current.get(key):
-                return False, "directory_manifest_changed", "live subtree {} changed at {}".format(key, relative)
+                return False, "directory_manifest_changed", "{} {} changed at {}".format(label, key, relative)
         # Some AList list responses omit GCID. If a valid live value is present,
         # require it to equal the original inventory value (including unknown).
         if current.get("gcid") is not None and current.get("gcid") != planned.get("gcid"):
-            return False, "directory_manifest_changed", "live subtree GCID changed at {}".format(relative)
+            return False, "directory_manifest_changed", "{} GCID changed at {}".format(label, relative)
     return True, "", ""
+
+
+def _verify_live_directory_manifest(client: "AListClient", action: dict,
+                                    current_name: str) -> Tuple[bool, str, str]:
+    expected = action.get("directory_manifest")
+    source_path = action["source_dir"].rstrip("/") + "/" + current_name
+    return _verify_live_manifest_at(client, source_path, expected, label="live subtree")
+
+
+def _verify_live_kept_directory_manifest(client: "AListClient", action: dict) -> Tuple[bool, str, str]:
+    proof = action.get("whole_pack_duplicate_proof")
+    if not isinstance(proof, dict):
+        return True, "", ""
+    peer_relative = action.get("kept_directory_relative_path")
+    peer_path = action.get("kept_directory_path")
+    peer_id = action.get("kept_directory_id")
+    if not isinstance(peer_relative, str) or not isinstance(peer_path, str) or not peer_id:
+        return False, "directory_manifest_invalid", "planned kept-peer directory identity is missing"
+    try:
+        peer_parts = _clean_relative_path(peer_relative, field="kept-peer directory")
+    except ReconcileError as exc:
+        return False, "directory_manifest_invalid", str(exc)
+    parent_path = action["source_dir"]
+    if len(peer_parts) < 2 or "/".join(peer_parts[:-1]) != action.get("source_dir_relative"):
+        return False, "directory_manifest_invalid", "kept peer is not a sibling of the source directory"
+    try:
+        parent_rows = client.list_all(parent_path, refresh=True)
+    except ReconcileError as exc:
+        return False, exc.code, str(exc)
+    named = [row for row in parent_rows if row.get("name") == peer_parts[-1]]
+    if len(named) != 1 or not _is_dir(named[0]) or _file_id(named[0]) != str(peer_id):
+        return False, "directory_manifest_changed", "live kept-peer directory identity changed"
+    return _verify_live_manifest_at(
+        client, peer_path, action.get("kept_directory_manifest"), label="live kept-peer subtree")
 
 
 def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
@@ -925,10 +1062,14 @@ def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
                 continue
 
             covered_videos = []
+            uncovered_videos = []
             valid = True
             subject_video_actions = video_actions.get(str(subject_id), {})
             for node, path in subtree_video_rows:
                 matches = subject_video_actions.get(path, [])
+                if not matches:
+                    uncovered_videos.append((node, path))
+                    continue
                 if (len(matches) != 1 or matches[0].get("state") != "planned"
                         or matches[0].get("file_id") != _file_id(node)
                         or _path_is_within(matches[0].get("kept_relative_path"), relative)):
@@ -937,6 +1078,13 @@ def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
                 covered_videos.append(matches[0])
             if not valid:
                 continue
+
+            whole_pack_peer = None
+            if uncovered_videos:
+                whole_pack_peer = _verified_duplicate_pack_peer(
+                    inventory, relative, manifest, covered_videos)
+                if whole_pack_peer is None:
+                    continue
 
             covered_video_ids = {action["action_id"] for action in covered_videos}
             covered_actions = list(covered_videos)
@@ -977,6 +1125,43 @@ def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
             if not isinstance(target_directory, str):
                 continue
             evidence = sorted(covered_actions, key=lambda row: (row.get("source_relative_path", ""), row["action_id"]))
+            whole_pack_proof = None
+            if whole_pack_peer is not None:
+                source_parts_for_proof = _clean_relative_path(relative, field="duplicate pack source")
+                covered_relative_files = set()
+                proof_valid = True
+                for action in covered_actions:
+                    try:
+                        action_parts = _clean_relative_path(action.get("source_relative_path"),
+                                                            field="covered duplicate source")
+                    except ReconcileError:
+                        proof_valid = False
+                        break
+                    if (len(action_parts) <= len(source_parts_for_proof)
+                            or action_parts[:len(source_parts_for_proof)] != source_parts_for_proof):
+                        proof_valid = False
+                        break
+                    covered_relative_files.add("/".join(action_parts[len(source_parts_for_proof):]))
+                source_signature = _directory_content_signature(manifest)
+                if not proof_valid or source_signature is None:
+                    continue
+                manifest_files = {row[0] for row in source_signature if row[1] == "file"}
+                if not covered_relative_files.issubset(manifest_files):
+                    continue
+                additional_files = manifest_files - covered_relative_files
+                whole_pack_proof = {
+                    "method": "sibling_complete_gcid_size_manifest",
+                    "peer_relative_path": whole_pack_peer["relative_path"],
+                    "manifest_entry_count": len(source_signature),
+                    "manifest_file_count": len(manifest_files),
+                    "additional_file_count": len(additional_files),
+                    "additional_video_count": len(uncovered_videos),
+                    "additional_video_relative_paths": sorted(
+                        path[len(relative) + 1:] for _, path in uncovered_videos),
+                    "manifest_sha256": hashlib.sha256(json.dumps(
+                        [list(row) for row in source_signature], ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8")).hexdigest(),
+                }
             candidates.append({
                 "subject_id": str(subject_id), "show_relative": show_relative,
                 "source_relative": relative, "source_parts": directory_parts,
@@ -984,7 +1169,21 @@ def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
                 "manifest": manifest, "covered": evidence,
                 "videos": covered_videos, "target_directory": target_directory,
                 "dependency": next(iter(dependencies)),
+                "whole_pack_peer": whole_pack_peer,
+                "whole_pack_proof": whole_pack_proof,
             })
+
+    # A peer used to prove a complete duplicate pack is the keeper and must
+    # remain outside every directory move, even if another candidate overlaps it.
+    protected_keeper_directories = {
+        row["whole_pack_peer"]["relative_path"] for row in candidates if row.get("whole_pack_peer")
+    }
+    candidates = [row for row in candidates if not any(
+        row["source_relative"] == keeper
+        or _path_is_within(keeper, row["source_relative"])
+        or _path_is_within(row["source_relative"], keeper)
+        for keeper in protected_keeper_directories
+    )]
 
     # Parent candidates win. A valid parent already covers every descendant
     # action, so emitting both would create overlapping moves.
@@ -1068,6 +1267,15 @@ def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
             } for row in covered],
             "state": "planned", "steps": [],
         }
+        if candidate.get("whole_pack_peer") and candidate.get("whole_pack_proof"):
+            peer = candidate["whole_pack_peer"]
+            directory_action.update({
+                "kept_directory_relative_path": peer["relative_path"],
+                "kept_directory_path": _join_root(cfg["alist"]["root"], peer["relative_path"]),
+                "kept_directory_id": peer["file_id"],
+                "kept_directory_manifest": peer["manifest"],
+                "whole_pack_duplicate_proof": candidate["whole_pack_proof"],
+            })
         candidate["action"] = directory_action
 
     folded_actions = [row["action"] for row in selected if row.get("action")]
@@ -1873,7 +2081,7 @@ class AListClient:
         total: Optional[int] = None
         while True:
             payload = self._post("/api/fs/list", {"path": path, "password": "", "page": page,
-                                                  "per_page": self.cfg["page_size"], "refresh": bool(refresh)},
+                                                  "per_page": self.cfg["page_size"], "refresh": bool(refresh and page == 1)},
                                  stage="list")
             data = payload.get("data")
             if not isinstance(data, dict) or not isinstance(data.get("content"), list):
@@ -2175,6 +2383,8 @@ def _apply_organization_move(report: dict, report_path: Path, client: AListClien
         if "directory_manifest" not in action:
             return True
         matches, code, message = _verify_live_directory_manifest(client, action, current_name)
+        if matches and action.get("whole_pack_duplicate_proof"):
+            matches, code, message = _verify_live_kept_directory_manifest(client, action)
         if matches:
             return True
         _block_action(action, code, message, fatal=True)

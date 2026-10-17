@@ -7,6 +7,8 @@ import types
 import unittest
 from unittest import mock
 
+from scripts import library_inventory as inventory_mod
+
 
 sys.modules.setdefault('oss2', types.SimpleNamespace())
 
@@ -239,6 +241,149 @@ class BangumiCloudDownloadSelectionTests(unittest.TestCase):
         self.assertEqual(chosen[0]['episode_key'], 'ep-005')
         self.assertEqual(chosen[0]['release_version'], 2)
 
+    def test_candidate_episode_numbering_maps_local_episode_to_bangumi_sort(self):
+        show = {'episode_numbering': {
+            'mode': 'season_relative',
+            'ep_to_sort': {'1': '15', '2': '16', '3': '17'},
+            'sort_to_ep': {'15': '1', '16': '2', '17': '3'},
+            'episode_ids': {'15': 1501, '16': 1502, '17': 1503},
+            'evidence': [], 'reason': None,
+        }}
+        item = {'title': '[Group] 测试番 第二季 [03] [简中]'}
+
+        self.assertEqual(mod.candidate_inventory_episode_key(item, show), 'EP17')
+
+    def test_candidate_episode_numbering_keeps_global_sort_episode(self):
+        show = {'episode_numbering': {
+            'mode': 'global_sort',
+            'ep_to_sort': {'1': '15', '2': '16', '3': '17'},
+            'sort_to_ep': {'15': '1', '16': '2', '17': '3'},
+            'episode_ids': {'15': 1501, '16': 1502, '17': 1503},
+            'evidence': [], 'reason': None,
+        }}
+
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [17] [简中]'}, show,
+        ), 'EP17')
+
+    def test_real_first_season_inventory_keeps_ep01_and_ep00_candidates(self):
+        subject = {
+            'subject_id': '1', 'collection_type': 3,
+            'subject': {'id': 1, 'name': 'Test Show', 'name_cn': '测试番', 'eps': 13},
+        }
+        raw_episodes = [{
+            'id': 1000 + number, 'subject_id': 1, 'type': 0,
+            'sort': number, 'ep': number, 'name': f'Episode {number}',
+            'airdate': '2000-01-01',
+        } for number in range(13)]
+        rows = inventory_mod.episode_records(raw_episodes, '1')
+        cloud = {
+            'name': '测试番', 'path': '在看/测试番', 'type': 'directory',
+            'empty': False, 'children': [{
+                'name': 'EP01.mkv', 'path': '在看/测试番/EP01.mkv',
+                'type': 'file', 'file_id': 'file-01', 'size': 10,
+            }],
+        }
+
+        show = inventory_mod.show_node_from_cloud(
+            cloud, subject=subject, episodes=rows, expected_known=True,
+        )
+
+        self.assertEqual(show['episode_numbering']['mode'], 'global_sort')
+        self.assertEqual(show['episode_numbering']['ep_to_sort'], {})
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [01] [简中]'}, show,
+        ), 'EP01')
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [00] [简中]'}, show,
+        ), 'EP00')
+
+    def test_ambiguous_numbering_does_not_make_a_download_candidate(self):
+        item = {'title': '[Group] 测试番 [03] [简中]'}
+        ambiguous = {'subject_id': '1', 'matched': True, 'unmatched': False,
+                     'source_path': '在看/测试番', 'episodes': [{
+                         'episode_id': 17, 'episode_key': 'EP17',
+                         'present': False, 'missing': True,
+                     }],
+                     'episode_numbering': {
+                         'mode': 'blocked', 'ep_to_sort': {}, 'sort_to_ep': {},
+                         'episode_ids': {}, 'evidence': [], 'reason': 'numbering_overlap',
+                     }}
+
+        self.assertEqual(mod.candidate_inventory_episode_key(item, ambiguous), '')
+        self.assertFalse(mod.is_safe_inventory_subject(ambiguous))
+
+    def test_non_global_numbering_without_alias_map_fails_closed(self):
+        show = {'episode_numbering': {
+            'mode': 'metadata_alias', 'ep_to_sort': {}, 'sort_to_ep': {},
+            'episode_ids': {}, 'evidence': [], 'reason': 'no_alias_map',
+        }}
+
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [01] [简中]'}, show,
+        ), '')
+        self.assertFalse(mod.is_safe_inventory_subject(show))
+
+    def test_overlapping_episode_and_sort_domains_are_rejected(self):
+        show = {'episode_numbering': {
+            'mode': 'metadata_alias',
+            'ep_to_sort': {'3': '17', '5': '3'},
+            'sort_to_ep': {'17': '3', '3': '5'},
+            'episode_ids': {'17': 1703, '3': 1705},
+            'evidence': [], 'reason': None,
+        }}
+
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [03] [简中]'}, show,
+        ), '')
+
+    def test_legacy_inventory_without_numbering_metadata_keeps_existing_key(self):
+        self.assertEqual(mod.candidate_inventory_episode_key(
+            {'title': '[Group] 测试番 [03] [简中]'}, {'episodes': []},
+        ), 'EP03')
+
+    def test_fresh_remote_local_episode_name_matches_its_sort_episode(self):
+        class FakeClient:
+            def get_file_list(self, parent_id, page_size, page):
+                return {'data': {'list': [
+                    {'fileId': 'file-ep03', 'fileName': 'EP03.mp4', 'resType': 1},
+                ], 'total': 1}}
+
+        show = {'episode_numbering': {
+            'mode': 'season_relative',
+            'ep_to_sort': {'1': '15', '2': '16', '3': '17'},
+            'sort_to_ep': {'15': '1', '16': '2', '17': '3'},
+            'episode_ids': {'15': 1501, '16': 1502, '17': 1503},
+            'evidence': [], 'reason': None,
+        }}
+
+        existing = mod.get_remote_episode_file_index(
+            FakeClient(), 'folder-1', ['EP17'], inventory_show=show,
+        )
+
+        self.assertEqual(existing, {'EP17': ['EP03.mp4']})
+
+    def test_fresh_global_sort_listing_also_checks_new_local_episode_alias(self):
+        class FakeClient:
+            def get_file_list(self, parent_id, page_size, page):
+                return {'data': {'list': [
+                    {'fileId': 'file-ep03', 'fileName': 'EP03.mp4', 'resType': 1},
+                ], 'total': 1}}
+
+        show = {'episode_numbering': {
+            'mode': 'global_sort',
+            'ep_to_sort': {'1': '15', '2': '16', '3': '17'},
+            'sort_to_ep': {'15': '1', '16': '2', '17': '3'},
+            'episode_ids': {'15': 1501, '16': 1502, '17': 1503},
+            'evidence': [], 'reason': None,
+        }}
+
+        existing = mod.get_remote_episode_file_index(
+            FakeClient(), 'folder-1', ['EP03', 'EP17'], inventory_show=show,
+        )
+
+        self.assertEqual(existing, {'EP03': ['EP03.mp4'], 'EP17': ['EP03.mp4']})
+
     def test_sidecar_subtitles_are_rejected_until_they_can_be_preserved(self):
         self.assertFalse(mod.is_single_episode_candidate('[Group] 测试番 [01][外挂字幕]'))
         self.assertTrue(mod.has_external_subtitle_files({
@@ -396,7 +541,7 @@ class BangumiCloudDownloadMikanOverrideTests(unittest.TestCase):
 class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
     def _fixture(self, *, dry_run, episode_count=12, missing_numbers=None,
                  rss_items=None, single_video=False, subtitle_sidecar=False,
-                 remote_target_items=None):
+                 remote_target_items=None, single_video_subfiles=None):
         class FakeBangumiClient:
             def __init__(self, cfg):
                 self.cfg = cfg
@@ -426,13 +571,16 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
 
         class FakeGuangYaClient:
             def __init__(self, single_video=False, subtitle_sidecar=False,
-                         target_items=None):
+                         target_items=None, single_subfiles=None):
                 self.created = []
                 self.submitted = []
                 self.single_video = single_video
                 self.subtitle_sidecar = subtitle_sidecar
                 self.target_items = list(target_items or [])
+                self.single_subfiles = (None if single_subfiles is None
+                                        else list(single_subfiles))
                 self.file_list_calls = []
+                self.resolved_torrents = 0
 
             def list_all_tasks(self):
                 return []
@@ -449,11 +597,15 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
 
             def resolve_torrent(self, torrent_url):
                 if self.single_video:
-                    subfiles = [{'fileIndex': 0, 'fileName': 'Movie.mkv'}]
-                    if self.subtitle_sidecar:
+                    self.resolved_torrents += 1
+                    subfiles = (list(self.single_subfiles) if self.single_subfiles is not None
+                                else [{'fileIndex': 0, 'fileName': 'Movie.mkv'}])
+                    if self.subtitle_sidecar and self.single_subfiles is None:
                         subfiles.append({'fileIndex': 1, 'fileName': 'Movie.ass'})
+                    info_hash = ('{:040x}'.format(self.resolved_torrents)
+                                 if self.single_subfiles is not None else 'b' * 40)
                     return {'data': {'btResInfo': {
-                        'infoHash': 'b' * 40,
+                        'infoHash': info_hash,
                         'subfiles': subfiles,
                     }}}
                 return {'data': {'btResInfo': {
@@ -503,6 +655,7 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
         client = None if dry_run else FakeGuangYaClient(
             single_video=single_video, subtitle_sidecar=subtitle_sidecar,
             target_items=remote_target_items,
+            single_subfiles=single_video_subfiles,
         )
         cfg = {
             'state_path': state_path, 'inventory_path': inventory_path,
@@ -528,6 +681,38 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
         for path in (state_path, inventory_path, progress_path):
             if os.path.exists(path):
                 os.unlink(path)
+
+    def _set_season_relative_episode_numbering(self, fixture, missing_sort_numbers=None):
+        missing_sort_numbers = set(missing_sort_numbers or {17})
+        with open(fixture[3], 'r', encoding='utf-8') as handle:
+            snapshot = json.load(handle)
+        show = snapshot['tree'][0]['shows'][0]
+        ep_to_sort = {}
+        sort_to_ep = {}
+        for episode in show['episodes']:
+            if episode.get('episode_id') is None:
+                continue
+            local_number = int(episode['episode_key'][2:])
+            sort_number = local_number + 14
+            ep_to_sort[str(local_number)] = str(sort_number)
+            sort_to_ep[str(sort_number)] = str(local_number)
+            episode['sort'] = sort_number
+            episode['episode_key'] = f'EP{sort_number:02d}'
+            episode['present'] = sort_number not in missing_sort_numbers
+            episode['missing'] = sort_number in missing_sort_numbers
+            episode['relative_path'] = (
+                None if sort_number in missing_sort_numbers else f'在看/测试番/EP{sort_number:02d}.mkv'
+            )
+            episode['file_id'] = None if sort_number in missing_sort_numbers else f'file-{sort_number}'
+            episode['file_name'] = None if sort_number in missing_sort_numbers else f'EP{sort_number:02d}.mkv'
+        show['episode_numbering'] = {
+            'mode': 'season_relative', 'ep_to_sort': ep_to_sort,
+            'sort_to_ep': sort_to_ep,
+            'episode_ids': {str(i + 14): i for i in range(1, 13)},
+            'evidence': [], 'reason': None,
+        }
+        with open(fixture[3], 'w', encoding='utf-8') as handle:
+            json.dump(snapshot, handle, ensure_ascii=False)
 
     def test_subject_override_precedes_cached_mapping_and_is_verified_before_planning(self):
         movie_item = {
@@ -696,6 +881,103 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
             self.assertEqual(result['skipped'][0]['existing_episode_keys'], ['EP01'])
             self.assertEqual(result['skipped'][0]['existing_target_files'], {'EP01': ['EP01.mp4']})
             self.assertIn(('dir-3', 100, 0), fixture[1].file_list_calls)
+        finally:
+            self._restore(fixture)
+
+    def test_season_relative_source_ep03_selects_local_file_but_submits_sort_ep17(self):
+        item = {
+            'guid': 'season-two-ep03',
+            'title': '[Group] 测试番 第二季 [03] [简中] [1080p]',
+            'torrent_url': 'https://example.com/test-show-s02e03.torrent',
+        }
+        fixture = self._fixture(
+            dry_run=False, episode_count=12, missing_numbers={3},
+            rss_items=[item], single_video=True,
+            single_video_subfiles=[
+                {'fileIndex': 2, 'fileName': '[Group] 测试番 第二季 [03].mkv'},
+                {'fileIndex': 16, 'fileName': '[Group] 测试番 [17].mkv'},
+            ],
+        )
+        self._set_season_relative_episode_numbering(fixture)
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 1)
+            self.assertEqual(fixture[1].submitted[0]['fileIndexes'], [2])
+            self.assertEqual(fixture[1].submitted[0]['newName'], 'EP17.mkv')
+        finally:
+            self._restore(fixture)
+
+    def test_multiple_season_relative_sources_keep_their_own_episode_labels(self):
+        items = [
+            {
+                'guid': 'season-two-ep03',
+                'title': '[Group] 测试番 第二季 [03] [简中] [1080p]',
+                'torrent_url': 'https://example.com/test-show-s02e03.torrent',
+            },
+            {
+                'guid': 'season-two-ep04',
+                'title': '[Group] 测试番 第二季 [04] [简中] [1080p]',
+                'torrent_url': 'https://example.com/test-show-s02e04.torrent',
+            },
+        ]
+        fixture = self._fixture(
+            dry_run=False, episode_count=12, missing_numbers={3, 4},
+            rss_items=items, single_video=True,
+            single_video_subfiles=[
+                {'fileIndex': 2, 'fileName': '[Group] 测试番 第二季 [03].mkv'},
+                {'fileIndex': 3, 'fileName': '[Group] 测试番 第二季 [04].mkv'},
+                {'fileIndex': 16, 'fileName': '[Group] 测试番 [17].mkv'},
+                {'fileIndex': 17, 'fileName': '[Group] 测试番 [18].mkv'},
+            ],
+        )
+        self._set_season_relative_episode_numbering(fixture, missing_sort_numbers={17, 18})
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 2)
+            self.assertEqual([task['fileIndexes'] for task in fixture[1].submitted], [[2], [3]])
+            self.assertEqual([task['newName'] for task in fixture[1].submitted],
+                             ['EP17.mkv', 'EP18.mkv'])
+        finally:
+            self._restore(fixture)
+
+    def test_fresh_season_relative_ep03_blocks_sort_ep17_submission(self):
+        item = {
+            'guid': 'season-two-ep03',
+            'title': '[Group] 测试番 第二季 [03] [简中] [1080p]',
+            'torrent_url': 'https://example.com/test-show-s02e03.torrent',
+        }
+        fixture = self._fixture(
+            dry_run=False, episode_count=12, missing_numbers={3},
+            rss_items=[item], single_video=True,
+            remote_target_items=[{
+                'fileId': 'new-local-ep03', 'fileName': 'EP03.mp4', 'resType': 1,
+            }],
+        )
+        self._set_season_relative_episode_numbering(fixture)
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 0)
+            self.assertEqual(fixture[1].submitted, [])
+            self.assertEqual(result['skipped'][0]['reason'], 'target_episode_already_present')
+            self.assertEqual(result['skipped'][0]['existing_episode_keys'], ['EP17'])
+            self.assertEqual(result['skipped'][0]['existing_target_files'], {'EP17': ['EP03.mp4']})
+        finally:
+            self._restore(fixture)
+
+    def test_season_relative_batch_is_skipped_with_explicit_reason(self):
+        fixture = self._fixture(dry_run=True)
+        self._set_season_relative_episode_numbering(fixture)
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=True)
+
+            self.assertEqual(result['planned_count'], 0)
+            self.assertTrue(any(
+                item.get('reason') == 'batch_episode_numbering_translation_unsupported'
+                for item in result['skipped']
+            ))
         finally:
             self._restore(fixture)
 
