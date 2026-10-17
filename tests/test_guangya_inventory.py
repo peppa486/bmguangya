@@ -49,8 +49,10 @@ class FakeGuangYaClient:
     def __init__(self, backend):
         self.backend = backend
         self.credentials = FakeCredentials(backend.root_path)
+        self.deadline_calls = []
 
-    def get_file_list(self, *, parent_id, page_size, page):
+    def get_file_list(self, *, parent_id, page_size, page, deadline_monotonic=None):
+        self.deadline_calls.append(deadline_monotonic)
         return self.backend.list_page(parent_id, page_size, page)
 
 
@@ -157,6 +159,20 @@ class GuangYaInventoryPaginationTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 3)
         self.assertEqual([(call[2]) for call in backend.calls if call[0] == 'anime-id'], [0, 1])
+
+    def test_deadline_is_forwarded_during_root_resolution_and_each_page(self):
+        backend = FakeBackend(entries={
+            'storage-root': [directory('anime-id', 'Anime')],
+            'anime-id': [file('f1', '01.mkv'), file('f2', '02.mkv')],
+        })
+        client, created_clients = adapter_for(backend)
+        deadline = 12345.0
+
+        rows = client.list_all('/guangya/Anime', page_size=1,
+                               deadline_monotonic=deadline)
+
+        self.assertEqual([row['name'] for row in rows], ['01.mkv', '02.mkv'])
+        self.assertEqual(created_clients[0].deadline_calls, [deadline, deadline, deadline])
 
     def test_missing_total_and_duplicate_page_ids_fail_closed(self):
         missing_total = FakeBackend(entries={

@@ -125,12 +125,16 @@ class GuangYaEnvelopeTests(unittest.TestCase):
 
         client._request = types.MethodType(fake_request, client)
         client.get_file_list(parent_id="folder", page_size=100, page=2)
+        client.get_file_list(parent_id="folder", page_size=100, page=3,
+                             deadline_monotonic=123.5)
         self.assertEqual(calls[0][:3], (
             "POST", "/nd.bizuserres.s/v1/file/get_file_list",
             {"parentId": "folder", "page": 2, "pageSize": 100,
              "orderBy": 3, "sortType": 1, "fileTypes": []},
         ))
         self.assertTrue(calls[0][3]["allow_empty_list_without_rows"])
+        self.assertIsNone(calls[0][3]["deadline_monotonic"])
+        self.assertEqual(calls[1][3]["deadline_monotonic"], 123.5)
 
 
 class GuangYaRefreshCoordinationTests(unittest.TestCase):

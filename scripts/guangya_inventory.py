@@ -206,13 +206,17 @@ class GuangYaInventoryClient:
             normalized["gcid"] = gcid.lower()
         return normalized
 
-    def _list_directory(self, client, parent_id: str, page_size: int) -> List[dict]:
+    def _list_directory(self, client, parent_id: str, page_size: int, *,
+                        deadline_monotonic: Optional[float] = None) -> List[dict]:
         entries: List[dict] = []
         seen_ids = set()
         expected_total: Optional[int] = None
         for page in range(10000):
             try:
-                response = client.get_file_list(parent_id=parent_id, page_size=page_size, page=page)
+                request_kwargs = {"parent_id": parent_id, "page_size": page_size, "page": page}
+                if deadline_monotonic is not None:
+                    request_kwargs["deadline_monotonic"] = deadline_monotonic
+                response = client.get_file_list(**request_kwargs)
             except GuangYaAPIError as exc:
                 raise GuangYaInventoryError("GuangYa inventory API request failed", code=exc.code) from None
             except Exception:
@@ -258,7 +262,8 @@ class GuangYaInventoryClient:
             raise GuangYaInventoryError("configured GuangYa inventory directory is ambiguous")
         return matches[0]["file_id"]
 
-    def _resolve_root_id(self, client, page_size: int) -> str:
+    def _resolve_root_id(self, client, page_size: int, *,
+                         deadline_monotonic: Optional[float] = None) -> str:
         with self._map_lock:
             cached = self._directory_ids.get(self.remote_root)
             if cached:
@@ -266,16 +271,19 @@ class GuangYaInventoryClient:
             parent_id = self._storage_root_id(client)
             current_path = self.mount_path
             for component in self.root_parts:
-                entries = self._list_directory(client, parent_id, page_size)
+                entries = self._list_directory(
+                    client, parent_id, page_size, deadline_monotonic=deadline_monotonic,
+                )
                 parent_id = self._unique_child_directory(entries, component)
                 current_path = posixpath.join(current_path, component)
                 self._directory_ids[current_path] = parent_id
             self._directory_ids[self.remote_root] = parent_id
             return parent_id
 
-    def _directory_id(self, client, path: str, page_size: int) -> str:
+    def _directory_id(self, client, path: str, page_size: int, *,
+                      deadline_monotonic: Optional[float] = None) -> str:
         if path == self.remote_root:
-            return self._resolve_root_id(client, page_size)
+            return self._resolve_root_id(client, page_size, deadline_monotonic=deadline_monotonic)
         with self._map_lock:
             file_id = self._directory_ids.get(path)
         if file_id:
@@ -298,14 +306,19 @@ class GuangYaInventoryClient:
                     raise GuangYaInventoryError("GuangYa directory path maps to conflicting fileIds")
             self._directory_ids.update(child_directories)
 
-    def list_all(self, remote_path: str, page_size: int = 100) -> List[dict]:
+    def list_all(self, remote_path: str, page_size: int = 100, *,
+                 deadline_monotonic: Optional[float] = None) -> List[dict]:
         if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 1000:
             raise GuangYaInventoryError("GuangYa page_size must be between 1 and 1000")
         path = self._normalize_path(remote_path, field="GuangYa inventory path")
         if path != self.remote_root and not path.startswith(self.remote_root.rstrip("/") + "/"):
             raise GuangYaInventoryError("inventory path is outside the configured AList root")
         client = self._client()
-        parent_id = self._directory_id(client, path, page_size)
-        entries = self._list_directory(client, parent_id, page_size)
+        parent_id = self._directory_id(
+            client, path, page_size, deadline_monotonic=deadline_monotonic,
+        )
+        entries = self._list_directory(
+            client, parent_id, page_size, deadline_monotonic=deadline_monotonic,
+        )
         self._cache_child_directories(path, entries)
         return entries

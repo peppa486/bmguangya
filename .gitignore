@@ -25,3 +25,6 @@ __pycache__/
 # 临时文件
 *.tmp
 *.bak
+
+# Local development and verification artifacts
+/work/

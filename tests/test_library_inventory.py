@@ -70,7 +70,7 @@ class FakeAlistTree:
         self.entries = entries
         self.calls = []
 
-    def list_all(self, path, page_size):
+    def list_all(self, path, page_size, *, deadline_monotonic=None):
         self.calls.append((path, page_size))
         return self.entries.get(path, [])
 
@@ -311,6 +311,26 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(failed["file_id"], "failed-dir-id")
         self.assertEqual(failed["size"], 9)
         self.assertEqual(failed["modified"], "2026-10-17T00:00:00Z")
+
+    def test_direct_guangya_scan_passes_shared_deadline_to_each_directory_listing(self):
+        class DeadlineAwareTree:
+            def __init__(self):
+                self.calls = []
+
+            def list_all(self, path, page_size, *, deadline_monotonic=None):
+                self.calls.append((path, page_size, deadline_monotonic))
+                return []
+
+        cfg = config()
+        cfg["inventory"]["cloud_source"] = "guangya_direct"
+        deadline = time.monotonic() + 60
+        cfg["alist"]["runtime_deadline_monotonic"] = deadline
+        client = DeadlineAwareTree()
+
+        scanner = inv.CloudScanner(cfg, client, workers=1)
+        scanner.scan()
+
+        self.assertEqual(client.calls, [("/guangya/Anime", cfg["alist"]["page_size"], deadline)])
 
     def test_alist_rejects_business_error_and_truncated_pages(self):
         cfg = config()

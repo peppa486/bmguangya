@@ -380,13 +380,15 @@ class GuangYaClient:
                                       retryable=True)
         time.sleep(delay)
 
-    def get_file_list(self, parent_id: str = "", page_size: int = 200, page: int = 0) -> dict:
+    def get_file_list(self, parent_id: str = "", page_size: int = 200, page: int = 0,
+                      *, deadline_monotonic: Optional[float] = None) -> dict:
         return self._request("POST", "/nd.bizuserres.s/v1/file/get_file_list",
                              data={"parentId": parent_id or "", "page": page,
                                    "pageSize": page_size, "orderBy": 3,
                                    "sortType": 1, "fileTypes": []},
                              readonly=True, expected_data="list",
-                             allow_empty_list_without_rows=True)
+                             allow_empty_list_without_rows=True,
+                             deadline_monotonic=deadline_monotonic)
 
     def create_dir(self, parent_id: str, name: str, fail_if_exist: bool = False) -> dict:
         return self._request("POST", "/nd.bizuserres.s/v1/file/create_dir",

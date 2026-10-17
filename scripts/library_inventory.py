@@ -718,6 +718,14 @@ class CloudScanner:
         self.progress = progress
 
     def _list_directory(self, path: str) -> List[dict]:
+        if self.cfg["inventory"]["cloud_source"] == "guangya_direct":
+            # GuangYa pagination can span several API calls. Pass the scanner's
+            # absolute deadline through the adapter so in-flight and queued
+            # retry work cannot keep issuing requests after the scan budget.
+            return self.client.list_all(
+                path, self.cfg["alist"]["page_size"],
+                deadline_monotonic=self.cfg["alist"].get("runtime_deadline_monotonic"),
+            )
         return self.client.list_all(path, self.cfg["alist"]["page_size"])
 
     def scan(self) -> dict:
