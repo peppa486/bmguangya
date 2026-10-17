@@ -136,6 +136,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["alist"]["max_workers"], 4)
         self.assertEqual(cfg["bangumi"]["username"], "user")
         self.assertEqual(cfg["inventory"]["progress_interval_seconds"], 15)
+        self.assertEqual(cfg["inventory"]["directory_max_attempts"], 3)
+
+    def test_directory_max_attempts_is_bounded(self):
+        for value in (0, 4):
+            with self.subTest(value=value), self.assertRaises(inv.InventoryError) as caught:
+                inv.normalize_config({
+                    "alist": {"public_url": "http://alist.test", "token": "a"},
+                    "bangumi": {"username": "u", "access_token": "b"},
+                    "inventory": {"directory_max_attempts": value},
+                })
+            self.assertEqual(caught.exception.issue["code"], "invalid_config")
 
     def test_nested_config_is_supported(self):
         cfg = inv.normalize_config({
@@ -215,6 +226,91 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(written["recent_errors"][0]["error_type"], "RemoteError")
         self.assertEqual(written["recent_errors"][0]["source_error_code"], 354)
         self.assertTrue(tree["children"][0]["incomplete"])
+
+    def test_cloud_scan_retries_failed_directory_and_does_not_rescan_successes(self):
+        class RecoveringTree:
+            def __init__(self):
+                self.calls = {}
+
+            def list_all(self, path, page_size):
+                self.calls[path] = self.calls.get(path, 0) + 1
+                if path == "/guangya/Anime":
+                    return [
+                        {"name": "稳定目录", "is_dir": True, "id": "stable-id"},
+                        {"name": "恢复目录", "is_dir": True, "id": "recover-id", "size": 7,
+                         "modified": "2026-10-17T00:00:00Z"},
+                    ]
+                if path.endswith("稳定目录"):
+                    return [{"name": "stable.mkv", "is_dir": False, "id": "stable-file"}]
+                if path.endswith("恢复目录") and self.calls[path] == 1:
+                    raise inv.InventoryError("temporary listing failure", stage="alist_scan", code="http_error")
+                if path.endswith("恢复目录"):
+                    return [{"name": "recovered.mkv", "is_dir": False, "id": "recovered-file"}]
+                raise AssertionError("unexpected path: " + path)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = config()
+            client = RecoveringTree()
+            progress = inv.InventoryProgress(root / "progress.json", source="alist", interval_seconds=1)
+            scanner = inv.CloudScanner(cfg, client, workers=2, progress=progress)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                tree = scanner.scan()
+            written = json.loads((root / "progress.json").read_text(encoding="utf-8"))
+            logs = output.getvalue()
+
+        self.assertEqual(client.calls["/guangya/Anime"], 1)
+        self.assertEqual(client.calls["/guangya/Anime/稳定目录"], 1)
+        self.assertEqual(client.calls["/guangya/Anime/恢复目录"], 2)
+        self.assertEqual(scanner.errors, [])
+        self.assertEqual(scanner.directory_retry_attempts, 1)
+        self.assertEqual(scanner.directories_recovered, 1)
+        self.assertEqual(written["status"], "complete")
+        self.assertEqual(written["directory_retry_attempts"], 1)
+        self.assertEqual(written["directories_recovered"], 1)
+        self.assertEqual(written["recent_retries"][-1]["state"], "recovered")
+        recovered = next(child for child in tree["children"] if child["name"] == "恢复目录")
+        self.assertEqual(recovered["children"][0]["name"], "recovered.mkv")
+        self.assertIn('"state":"recovered"', logs)
+
+    def test_cloud_scan_permanent_directory_failure_exhausts_bounded_attempts(self):
+        class PermanentlyBrokenTree:
+            def __init__(self):
+                self.calls = {}
+
+            def list_all(self, path, page_size):
+                self.calls[path] = self.calls.get(path, 0) + 1
+                if path == "/guangya/Anime":
+                    return [{"name": "故障目录", "is_dir": True, "id": "failed-dir-id", "size": 9,
+                             "modified": "2026-10-17T00:00:00Z"}]
+                raise inv.InventoryError("still unavailable", stage="alist_scan", code="http_error")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = config()
+            client = PermanentlyBrokenTree()
+            progress = inv.InventoryProgress(root / "progress.json", source="alist", interval_seconds=1)
+            scanner = inv.CloudScanner(cfg, client, workers=1, progress=progress)
+            tree = scanner.scan()
+            written = json.loads((root / "progress.json").read_text(encoding="utf-8"))
+
+        failed_path = "/guangya/Anime/故障目录"
+        self.assertEqual(client.calls["/guangya/Anime"], 1)
+        self.assertEqual(client.calls[failed_path], 3)
+        self.assertEqual(len(scanner.errors), 1)
+        self.assertEqual(scanner.errors[0]["attempts"], 3)
+        self.assertEqual(scanner.errors[0]["path"], failed_path)
+        self.assertEqual(scanner.directory_retry_attempts, 2)
+        self.assertEqual(scanner.directories_recovered, 0)
+        self.assertEqual(written["status"], "incomplete")
+        self.assertEqual(written["directories_failed"], 1)
+        self.assertEqual(written["recent_retries"][-1]["state"], "failed")
+        failed = tree["children"][0]
+        self.assertTrue(failed["incomplete"])
+        self.assertEqual(failed["file_id"], "failed-dir-id")
+        self.assertEqual(failed["size"], 9)
+        self.assertEqual(failed["modified"], "2026-10-17T00:00:00Z")
 
     def test_alist_rejects_business_error_and_truncated_pages(self):
         cfg = config()

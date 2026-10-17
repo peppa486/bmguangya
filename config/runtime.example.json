@@ -58,6 +58,7 @@
     "prefer_resolutions": ["1080p", "2160p", "720p"]
   },
   "inventory": {
+    "directory_max_attempts": 3,
     "output": "/var/lib/bmguangya/library.json",
     "progress_path": "/var/lib/bmguangya/library.progress.json",
     "progress_interval_seconds": 15,

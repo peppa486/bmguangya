@@ -97,7 +97,7 @@ sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/sync_library_strm.py
   --report /var/lib/bmguangya/strm-sync-report.json --dry-run
 ```
 
-库存扫描只读读取 Bangumi、AList/光鸭并写入本地库存、进度与失败报告；其间可能请求 AList 刷新光鸭挂载。下载 dry-run 会读取 Bangumi、Mikan、光鸭任务与完整库存，但不会提交云端任务或更新下载状态。整理和 STRM dry-run 会写本地报告，不会移动云端文件、不写媒体目录、也不会请求 Jellyfin。
+库存扫描只读读取 Bangumi、AList/光鸭并写入本地库存、进度与失败报告；其间可能请求 AList 刷新光鸭挂载。扫描会保留同轮成功的目录，只在末尾重试失败目录；`inventory.directory_max_attempts` 默认 3，耗尽后仍拒绝发布不完整库存。下载 dry-run 会读取 Bangumi、Mikan 与完整库存，但不会提交云端任务或更新下载状态，也不证明实时配额充足。整理和 STRM dry-run 会写本地报告，不会移动云端文件、不写媒体目录、也不会请求 Jellyfin。
 
 如果要整理未归类文件，先在配置中将 `reconcile.organize_unassigned` 设为 `true`，重跑库存和整理 dry-run，核对每个目标目录、重复冲突、字幕配对和待核对归档。只有确认报告符合预期后才执行真实流水线。`--apply` 会提交任务、移动/重命名已确认的云端文件，或写入/归档本地 STRM/NFO；不会删除云盘文件。真实流水线各阶段会重新扫描库存，失败时停止后续阶段。
 

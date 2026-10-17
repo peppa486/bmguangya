@@ -42,6 +42,7 @@ DEFAULT_MAX_RUNTIME_SECONDS = 1800
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 15
+DEFAULT_DIRECTORY_MAX_ATTEMPTS = 3
 
 
 class InventoryError(RuntimeError):
@@ -165,6 +166,11 @@ def normalize_config(raw: dict) -> dict:
     max_runtime = int(_first_value(inventory.get("max_runtime_seconds"), DEFAULT_MAX_RUNTIME_SECONDS))
     if max_runtime < 1:
         raise InventoryError("inventory.max_runtime_seconds must be positive", stage="config", code="invalid_config")
+    directory_max_attempts = int(_first_value(inventory.get("directory_max_attempts"),
+                                               DEFAULT_DIRECTORY_MAX_ATTEMPTS))
+    if not 1 <= directory_max_attempts <= 3:
+        raise InventoryError("inventory.directory_max_attempts must be between 1 and 3",
+                             stage="config", code="invalid_config")
     cloud_source = str(_first_value(inventory.get("cloud_source"), "alist")).strip().lower()
     if cloud_source not in {"alist", "guangya_direct"}:
         raise InventoryError("inventory.cloud_source must be 'alist' or 'guangya_direct'",
@@ -213,6 +219,7 @@ def normalize_config(raw: dict) -> dict:
             "progress_interval_seconds": progress_interval,
             "freshness_ttl_seconds": int(_first_value(inventory.get("freshness_ttl_seconds"), DEFAULT_FRESHNESS_TTL)),
             "max_runtime_seconds": max_runtime,
+            "directory_max_attempts": directory_max_attempts,
             "cloud_source": cloud_source,
             "guangya_api_base": str(_first_value(guangya.get("api_base"), "https://api.guangyapan.com")).rstrip("/"),
         },
@@ -701,8 +708,13 @@ class CloudScanner:
         self.workers = min(MAX_WORKERS, max(1, int(workers or cfg["alist"]["max_workers"])))
         self.max_depth = int(max_depth if max_depth is not None else cfg["alist"]["max_depth"])
         self.max_directories = int(max_directories if max_directories is not None else cfg["alist"]["max_directories"])
+        self.directory_max_attempts = int(cfg["inventory"].get(
+            "directory_max_attempts", DEFAULT_DIRECTORY_MAX_ATTEMPTS))
         self.errors: List[dict] = []
         self._listed: Dict[str, dict] = {}
+        self.directory_retry_attempts = 0
+        self.directories_recovered = 0
+        self.recent_retries: List[dict] = []
         self.progress = progress
 
     def _list_directory(self, path: str) -> List[dict]:
@@ -712,6 +724,8 @@ class CloudScanner:
         root_path = self.cfg["alist"]["root"]
         pending = [(root_path, 0)]
         seen = {root_path}
+        failed_directories: Dict[str, dict] = {}
+        retry_history: List[dict] = []
         started = time.monotonic()
         completed = 0
         attempted = 0
@@ -723,7 +737,7 @@ class CloudScanner:
                 files_seen=0, active_paths=[], errors=self.errors, force=True,
             )
 
-        def record_directory_error(path: str, exc: Exception) -> None:
+        def record_directory_error(path: str, exc: Exception, *, attempts: Optional[int] = None) -> dict:
             if isinstance(exc, InventoryError):
                 issue = exc.issue.copy()
                 issue.setdefault("error_type", type(exc).__name__)
@@ -737,7 +751,56 @@ class CloudScanner:
                     issue["source_error_code"] = source_code
             issue.setdefault("stage", "alist_scan")
             issue.setdefault("path", path)
+            if attempts is not None:
+                issue["attempts"] = attempts
             self.errors.append(issue)
+            return issue
+
+        def remove_error(issue: dict) -> None:
+            for index, candidate in enumerate(self.errors):
+                if candidate is issue:
+                    del self.errors[index]
+                    return
+
+        def record_retry_event(path: str, attempt: int, state: str,
+                               issue: Optional[dict] = None) -> None:
+            event = {"path": path, "attempt": attempt, "state": state}
+            if issue:
+                event.update({key: issue.get(key) for key in
+                              ("error_type", "code", "source_error_code")})
+            retry_history.append(event)
+            del retry_history[:-20]
+            self.recent_retries = list(retry_history)
+
+        def accept_listing(path: str, depth: int, entries: List[dict]) -> None:
+            self._listed[path] = {"path": path, "depth": depth, "entries": entries}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    self.errors.append({"stage": "alist_scan", "code": "invalid_entry",
+                                        "message": "AList returned a non-object directory entry", "path": path})
+                    continue
+                if not _is_dir(entry):
+                    continue
+                name = str(entry.get("name") or "")
+                if not name or name in (".", "..") or "/" in name or "\\" in name:
+                    self.errors.append({"stage": "alist_scan", "code": "invalid_entry_name",
+                                        "message": "AList returned an invalid directory name", "path": path})
+                    continue
+                child_path = _join_remote(path, name)
+                if child_path in seen:
+                    self.errors.append({"stage": "alist_scan", "code": "directory_cycle",
+                                        "message": "AList directory path repeated", "path": child_path})
+                    continue
+                if depth + 1 > self.max_depth:
+                    self.errors.append({"stage": "alist_scan", "code": "depth_limit",
+                                        "message": "Maximum directory depth reached", "path": child_path})
+                    continue
+                if len(seen) >= self.max_directories:
+                    self.errors.append({"stage": "alist_scan", "code": "directory_limit",
+                                        "message": "Maximum directory count reached", "path": child_path})
+                    continue
+                seen.add(child_path)
+                pending.append((child_path, depth + 1))
 
         def publish(active_paths: Sequence[str], *, force: bool = False) -> None:
             if not self.progress:
@@ -752,70 +815,110 @@ class CloudScanner:
                 directories_pending=len(pending) + active_pending,
                 files_seen=sum(sum(1 for entry in item["entries"] if not _is_dir(entry))
                                for item in self._listed.values()),
-                active_paths=list(active_paths), errors=self.errors, force=force,
+                active_paths=list(active_paths), errors=self.errors,
+                directory_max_attempts=self.directory_max_attempts,
+                directory_retry_attempts=self.directory_retry_attempts,
+                directories_recovered=self.directories_recovered,
+                recent_retries=self.recent_retries, force=force,
             )
 
         futures = {}
         deadline_reached = False
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            while pending or futures:
-                if not deadline_reached:
-                    try:
-                        _request_timeout(self.cfg["alist"], stage="alist_scan")
-                    except InventoryError as exc:
-                        self.errors.append(exc.issue)
-                        deadline_reached = True
+            while True:
+                # First visit every discovered directory once. Successful paths
+                # are never queued again; only failed listings enter retry rounds.
+                while pending or futures:
+                    if not deadline_reached:
+                        try:
+                            _request_timeout(self.cfg["alist"], stage="alist_scan")
+                        except InventoryError as exc:
+                            self.errors.append(exc.issue)
+                            deadline_reached = True
 
-                while pending and len(futures) < self.workers and not deadline_reached:
-                    path, depth = pending.pop(0)
-                    futures[pool.submit(self._list_directory, path)] = (path, depth)
-                    attempted += 1
-                active_paths = [details[0] for details in futures.values()]
-                publish(active_paths)
+                    while pending and len(futures) < self.workers and not deadline_reached:
+                        path, depth = pending.pop(0)
+                        futures[pool.submit(self._list_directory, path)] = (path, depth)
+                        attempted += 1
+                    active_paths = [details[0] for details in futures.values()]
+                    publish(active_paths)
 
-                if not futures:
-                    break
-                interval = self.progress.interval_seconds if self.progress else DEFAULT_PROGRESS_INTERVAL_SECONDS
-                done, _ = wait(tuple(futures), timeout=interval, return_when=FIRST_COMPLETED)
-                if not done:
-                    # Keep a durable heartbeat with the exact directory paths
-                    # currently waiting on the remote API.
-                    publish([details[0] for details in futures.values()], force=True)
-                    continue
-
-                for future in done:
-                    path, depth = futures.pop(future)
-                    completed += 1
-                    try:
-                        entries = future.result()
-                        self._listed[path] = {"path": path, "depth": depth, "entries": entries}
-                    except Exception as exc:
-                        record_directory_error(path, exc)
+                    if not futures:
+                        break
+                    interval = self.progress.interval_seconds if self.progress else DEFAULT_PROGRESS_INTERVAL_SECONDS
+                    done, _ = wait(tuple(futures), timeout=interval, return_when=FIRST_COMPLETED)
+                    if not done:
+                        # Keep a durable heartbeat with the exact paths waiting
+                        # on the remote API.
+                        publish([details[0] for details in futures.values()], force=True)
                         continue
-                    for entry in entries:
-                        if not _is_dir(entry):
-                            continue
-                        name = str(entry.get("name") or "")
-                        if not name or name in (".", "..") or "/" in name or "\\" in name:
-                            self.errors.append({"stage": "alist_scan", "code": "invalid_entry_name",
-                                                "message": "AList returned an invalid directory name", "path": path})
-                            continue
-                        child_path = _join_remote(path, name)
-                        if child_path in seen:
-                            self.errors.append({"stage": "alist_scan", "code": "directory_cycle",
-                                                "message": "AList directory path repeated", "path": child_path})
-                            continue
-                        if depth + 1 > self.max_depth:
-                            self.errors.append({"stage": "alist_scan", "code": "depth_limit",
-                                                "message": "Maximum directory depth reached", "path": child_path})
-                            continue
-                        if len(seen) >= self.max_directories:
-                            self.errors.append({"stage": "alist_scan", "code": "directory_limit",
-                                                "message": "Maximum directory count reached", "path": child_path})
-                            continue
-                        seen.add(child_path)
-                        pending.append((child_path, depth + 1))
-                publish([details[0] for details in futures.values()])
+
+                    for future in done:
+                        path, depth = futures.pop(future)
+                        completed += 1
+                        try:
+                            entries = future.result()
+                            if not isinstance(entries, list):
+                                raise InventoryError("directory listing was not a list", stage="alist_scan",
+                                                     code="invalid_response", details={"path": path})
+                            accept_listing(path, depth, entries)
+                        except Exception as exc:
+                            issue = record_directory_error(path, exc, attempts=1)
+                            failed_directories[path] = {"depth": depth, "attempts": 1, "issue": issue}
+                    publish([details[0] for details in futures.values()])
+
+                retry_candidates = [(path, details) for path, details in failed_directories.items()
+                                     if details["attempts"] < self.directory_max_attempts]
+                if deadline_reached or not retry_candidates:
+                    break
+                try:
+                    _request_timeout(self.cfg["alist"], stage="alist_scan")
+                except InventoryError as exc:
+                    self.errors.append(exc.issue)
+                    deadline_reached = True
+                    break
+
+                retry_futures = {}
+                for path, details in retry_candidates:
+                    # A failed path has no successful listing; retain the guard
+                    # so future changes cannot accidentally rescan successful ones.
+                    if path in self._listed:
+                        remove_error(details["issue"])
+                        failed_directories.pop(path, None)
+                        self.directories_recovered += 1
+                        record_retry_event(path, details["attempts"], "recovered", details["issue"])
+                        continue
+                    retry_futures[pool.submit(self._list_directory, path)] = (path, details)
+                    self.directory_retry_attempts += 1
+                    attempted += 1
+                publish([details[0] for details in retry_futures.values()], force=True)
+                while retry_futures:
+                    interval = self.progress.interval_seconds if self.progress else DEFAULT_PROGRESS_INTERVAL_SECONDS
+                    done, _ = wait(tuple(retry_futures), timeout=interval, return_when=FIRST_COMPLETED)
+                    if not done:
+                        publish([details[0] for details in retry_futures.values()], force=True)
+                        continue
+                    for future in done:
+                        path, prior = retry_futures.pop(future)
+                        completed += 1
+                        attempt_number = prior["attempts"] + 1
+                        try:
+                            entries = future.result()
+                            if not isinstance(entries, list):
+                                raise InventoryError("directory listing was not a list", stage="alist_scan",
+                                                     code="invalid_response", details={"path": path})
+                            accept_listing(path, prior["depth"], entries)
+                            remove_error(prior["issue"])
+                            failed_directories.pop(path, None)
+                            self.directories_recovered += 1
+                            record_retry_event(path, attempt_number, "recovered", prior["issue"])
+                        except Exception as exc:
+                            issue = record_directory_error(path, exc, attempts=attempt_number)
+                            remove_error(prior["issue"])
+                            failed_directories[path] = {"depth": prior["depth"],
+                                                        "attempts": attempt_number, "issue": issue}
+                            record_retry_event(path, attempt_number, "failed", issue)
+                    publish([details[0] for details in retry_futures.values()], force=True)
 
         final_status = "complete" if not self.errors and not pending else "incomplete"
         if self.progress:
@@ -827,6 +930,10 @@ class CloudScanner:
                 files_seen=sum(sum(1 for entry in item["entries"] if not _is_dir(entry))
                                for item in self._listed.values()),
                 active_paths=[], errors=self.errors, elapsed_seconds=round(time.monotonic() - started, 1),
+                directory_max_attempts=self.directory_max_attempts,
+                directory_retry_attempts=self.directory_retry_attempts,
+                directories_recovered=self.directories_recovered,
+                recent_retries=self.recent_retries,
                 force=True,
             )
         return self._build_tree(root_path)
@@ -837,7 +944,10 @@ class CloudScanner:
             if listed is None:
                 return {
                     "name": name, "type": "directory", "path": _relative_to_root(root_path, path),
-                    "children": [], "size": None, "modified": None, "empty": False, "incomplete": True,
+                    "children": [], "size": (entry_meta or {}).get("size"),
+                    "modified": (entry_meta or {}).get("modified"),
+                    "file_id": (entry_meta or {}).get("file_id") or (entry_meta or {}).get("id"),
+                    "empty": False, "incomplete": True,
                 }
             children = []
             for entry in listed["entries"]:
@@ -1521,12 +1631,13 @@ class InventoryProgress:
         should_log = force or self.last_log_monotonic is None or now - self.last_log_monotonic >= self.interval_seconds
         if should_log:
             self.last_log_monotonic = now
-            summary = {key: payload.get(key) for key in (
+            summary = {key: payload[key] for key in (
                 "status", "phase", "source", "root", "directories_discovered", "directories_started",
                 "directories_completed", "directories_succeeded", "directories_failed",
                 "directories_pending", "files_seen", "active_paths", "error_counts", "recent_errors",
+                "directory_max_attempts", "directory_retry_attempts", "directories_recovered", "recent_retries",
                 "elapsed_seconds",
-            )}
+            ) if key in payload}
             print(json.dumps({"event": "inventory_progress", **summary}, ensure_ascii=False,
                              separators=(",", ":")), flush=True)
 
@@ -1645,6 +1756,11 @@ def run_inventory(config_path: Path, output_path: Optional[Path] = None, cache_p
         scanner = CloudScanner(cfg, alist, workers=workers, progress=progress)
         cloud_root = scanner.scan()
         source_timestamps["alist"]["completed_at"] = timestamp()
+        source_timestamps["alist"].update({
+            "directory_max_attempts": scanner.directory_max_attempts,
+            "directory_retry_attempts": scanner.directory_retry_attempts,
+            "directories_recovered": scanner.directories_recovered,
+        })
         errors.extend(scanner.errors)
         completed = timestamp()
         report = build_report(
