@@ -176,7 +176,7 @@ class GuangYaTaskPaginationTests(unittest.TestCase):
             {"data": {"list": [{"taskId": "1"}, {"taskId": "2"}],
                       "hasMore": True, "cursor": "opaque-one", "total": 3}},
             {"data": {"list": [{"taskId": "2"}, {"taskId": "3"}],
-                      "hasMore": False, "cursor": "opaque-two", "total": 3}},
+                      "cursor": "opaque-two", "total": 3}},
         ]
 
         def fake_request(self, method, path, *, data=None, readonly=False,
@@ -203,6 +203,59 @@ class GuangYaTaskPaginationTests(unittest.TestCase):
         client._request = types.MethodType(lambda *args, **kwargs: page, client)
         with self.assertRaisesRegex(GuangYaAPIError, "no valid total"):
             client.list_all_tasks()
+
+    def test_missing_has_more_is_rejected_before_cumulative_total(self):
+        client = GuangYaClient.__new__(GuangYaClient)
+        page = {"msg": "success", "data": {"list": [{"taskId": "1"}], "total": 2}}
+        client._request = types.MethodType(lambda *args, **kwargs: page, client)
+        with self.assertRaisesRegex(GuangYaAPIError, "omitted hasMore"):
+            client.list_all_tasks()
+
+    def test_explicit_non_boolean_has_more_is_rejected_even_at_total(self):
+        client = GuangYaClient.__new__(GuangYaClient)
+        page = {"msg": "success", "data": {
+            "list": [{"taskId": "1"}], "total": 1, "hasMore": 0,
+        }}
+        client._request = types.MethodType(lambda *args, **kwargs: page, client)
+        with self.assertRaisesRegex(GuangYaAPIError, "valid hasMore"):
+            client.list_all_tasks()
+
+    def test_true_has_more_conflicts_with_cumulative_total(self):
+        client = GuangYaClient.__new__(GuangYaClient)
+        page = {"msg": "success", "data": {
+            "list": [{"taskId": "1"}], "total": 1, "hasMore": True,
+        }}
+        client._request = types.MethodType(lambda *args, **kwargs: page, client)
+        with self.assertRaisesRegex(GuangYaAPIError, "hasMore conflicts"):
+            client.list_all_tasks()
+
+    def test_new_account_empty_success_data_object_is_a_valid_empty_scan(self):
+        client = GuangYaClient(
+            {}, session=FakeSession({"msg": "success", "data": {}}),
+            credential_provider=FakeCredentials(),
+        )
+        self.assertEqual(client.list_all_tasks(), [])
+
+    def test_error_envelope_with_empty_data_is_not_an_empty_task_scan(self):
+        client = GuangYaClient(
+            {}, session=FakeSession({"msg": "error", "data": {}}),
+            credential_provider=FakeCredentials(),
+        )
+        with self.assertRaises(GuangYaAPIError):
+            client.list_all_tasks()
+
+    def test_empty_task_normalization_does_not_accept_other_incomplete_envelopes(self):
+        for envelope in (
+            {"msg": "success", "data": None},
+            {"msg": "success", "data": {"total": 0}},
+            {"msg": "success", "data": {"total": 0, "list": None}},
+        ):
+            client = GuangYaClient.__new__(GuangYaClient)
+            client._request = types.MethodType(
+                lambda *args, _payload=envelope, **kwargs: _payload, client,
+            )
+            with self.subTest(envelope=envelope), self.assertRaises(GuangYaAPIError):
+                client.list_all_tasks()
 
 
 class GuangYaReadonlyRequestTests(unittest.TestCase):

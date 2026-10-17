@@ -461,19 +461,23 @@ class GuangYaClient:
             if cursor:
                 body["cursor"] = cursor
             payload = self._request("POST", "/cloudcollection/v1/list_task", data=body,
-                                    readonly=True, expected_data="list",
+                                    readonly=True,
                                     deadline_monotonic=deadline)
             elapsed = time.monotonic() - started
             if elapsed >= deadline - started:
                 raise GuangYaAPIError("GuangYa cloud task scan exceeded its configured deadline",
                                       retryable=True)
             pages_read = page_index + 1
-            data = payload["data"]
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                raise GuangYaAPIError("GuangYa task page has no valid data object")
+            if payload.get("msg") == "success" and data == {}:
+                # A new account with no cloud tasks omits all protobuf-default
+                # fields. Normalize only this exact success envelope here.
+                data = {"total": 0, "list": []}
             rows = data.get("list")
             if not isinstance(rows, list):
                 raise GuangYaAPIError("GuangYa task page has no list")
-            if not isinstance(data.get("hasMore"), bool):
-                raise GuangYaAPIError("GuangYa task page has no valid hasMore flag")
             total = data.get("total")
             if isinstance(total, bool) or not isinstance(total, int) or total < 0:
                 raise GuangYaAPIError("GuangYa task page has no valid total")
@@ -488,12 +492,23 @@ class GuangYaClient:
                 if task_id not in seen_task_ids:
                     seen_task_ids.add(task_id)
                     results.append(row)
+            if len(seen_task_ids) > expected_total:
+                raise GuangYaAPIError("GuangYa task pagination exceeded the reported total")
             if pages_read % 10 == 0:
                 logger.info(
                     "GuangYa task scan progress pages=%d rows=%d total=%d elapsed_seconds=%.1f",
                     pages_read, len(results), expected_total, elapsed,
                 )
-            if not bool(data.get("hasMore")):
+            has_more_present = "hasMore" in data
+            if has_more_present and not isinstance(data["hasMore"], bool):
+                raise GuangYaAPIError("GuangYa task page has no valid hasMore flag")
+            if not has_more_present:
+                if len(seen_task_ids) != expected_total:
+                    raise GuangYaAPIError("GuangYa task page omitted hasMore before reaching total")
+                has_more = False
+            else:
+                has_more = data["hasMore"]
+            if not has_more:
                 if len(seen_task_ids) != expected_total:
                     raise GuangYaAPIError("GuangYa task pagination ended before the reported total")
                 if time.monotonic() >= deadline:

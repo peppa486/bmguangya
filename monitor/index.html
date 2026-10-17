@@ -57,6 +57,9 @@
   const CATEGORIES=['在看','未标记','想看','看过'];
   const $=id=>document.getElementById(id);
   let data=null, progressSnapshot=null, inventoryProgressSnapshot=null, unavailableMessage=null, activeCategory='在看', query='';
+  let refreshInFlight=false;
+  const REFRESH_TIMEOUT_MS=22000;
+  const expandedTreePaths=new Set();
   const esc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const fmtTime=value=>{if(!value)return'未知';const date=new Date(value);return Number.isNaN(date.getTime())?String(value):new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'medium',timeStyle:'medium'}).format(date)};
   const fmtDuration=value=>{if(!Number.isFinite(value)||value<0)return'未知';const seconds=Math.floor(value);const hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60),remaining=seconds%60;return hours?`${hours} 小时 ${minutes} 分钟`:minutes?`${minutes} 分 ${remaining} 秒`:`${remaining} 秒`};
@@ -155,13 +158,26 @@
     }).join('');
   }
 
-  function renderNode(node, depth=0){
+  function captureTreeExpansion(){
+    document.querySelectorAll('#tree details[data-expand-key]').forEach(details=>{
+      const key=details.dataset.expandKey;
+      if(!key)return;
+      if(details.open)expandedTreePaths.add(key);else expandedTreePaths.delete(key);
+    });
+  }
+  function restoreTreeExpansion(container){
+    container.querySelectorAll('details[data-expand-key]').forEach(details=>{
+      details.open=expandedTreePaths.has(details.dataset.expandKey);
+    });
+  }
+  function renderNode(node, depth=0, parentPath=''){
     if(depth>12)return'';
     const name=esc(node.name||node.path||'未命名节点');
     if(node.type==='directory'){
       const children=Array.isArray(node.children)?node.children:[];
       const label=`${name} · ${children.length} 项`;
-      return `<details class="node"><summary>${label}</summary>${children.map(child=>renderNode(child,depth+1)).join('')}</details>`;
+      const path=typeof node.path==='string'&&node.path?node.path:[parentPath,String(node.name||'')].filter(Boolean).join('/');
+      return `<details class="node" data-expand-key="${esc(`node:${path}`)}"><summary>${label}</summary>${children.map(child=>renderNode(child,depth+1,path)).join('')}</details>`;
     }
     const size=Number.isFinite(node.size)?`${(node.size/1024/1024).toFixed(1)} MB`:'';
     const modified=node.modified?fmtTime(node.modified):'';
@@ -169,6 +185,7 @@
   }
 
   function renderTree(){
+    captureTreeExpansion();
     if(!data){$('categorySummary').textContent='-';$('resultCount').textContent='';$('tree').innerHTML='<div class="empty">当前没有可展示的完整清单</div>';return;}
     const section=(data.tree||[]).find(item=>item.category===activeCategory);
     const container=$('tree');
@@ -200,9 +217,11 @@
       (show.episodes||[]).filter(ep=>ep.coverage_unknown).forEach(ep=>issues.push(`Bangumi 集数无法确定：${ep.name||ep.episode_key||ep.episode_id||'未知条目'}`));
       const issueHtml=issues.length?`<ul class="issues">${issues.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`:'';
       const children=Array.isArray(show.children)?show.children:[];
-      const nodes=children.map(node=>renderNode(node)).join('');
-      return `<article class="show"><div class="show-head"><div class="show-main"><span aria-hidden="true">▸</span><div style="min-width:0"><div class="show-name">${esc(show.name||show.cloud_name||'未命名番剧')}</div><div class="show-path">${hasCloud?esc(show.source_path):'尚无已匹配的云端目录'}${show.subject_id?` · Bangumi ID ${esc(show.subject_id)}`:''}</div></div></div><div class="badges">${badges.join('')}</div></div><div class="show-body"><div class="show-summary"><strong>云端视频 ${count}</strong><span>${esc(expected)}</span><span>${missing===null?'缺集未判定':`已播缺集 ${missing}`}</span><span>嵌套目录 ${(show.dirs||[]).length}</span></div>${missingList}${issueHtml}${children.length?`<details><summary>查看真实云端目录树（${children.length} 项）</summary>${nodes}</details>`:(show.vids||[]).map(v=>`<div class="node file">${esc(v.name)}</div>`).join('')||'<div>暂无云端文件</div>'}</div></article>`;
+      const showPath=String(show.source_path||show.path||`subject:${show.subject_id||show.name||show.cloud_name||index}`);
+      const nodes=children.map(node=>renderNode(node,0,showPath)).join('');
+      return `<article class="show"><div class="show-head"><div class="show-main"><span aria-hidden="true">▸</span><div style="min-width:0"><div class="show-name">${esc(show.name||show.cloud_name||'未命名番剧')}</div><div class="show-path">${hasCloud?esc(show.source_path):'尚无已匹配的云端目录'}${show.subject_id?` · Bangumi ID ${esc(show.subject_id)}`:''}</div></div></div><div class="badges">${badges.join('')}</div></div><div class="show-body"><div class="show-summary"><strong>云端视频 ${count}</strong><span>${esc(expected)}</span><span>${missing===null?'缺集未判定':`已播缺集 ${missing}`}</span><span>嵌套目录 ${(show.dirs||[]).length}</span></div>${missingList}${issueHtml}${children.length?`<details data-expand-key="${esc(`show:${showPath}`)}"><summary>查看真实云端目录树（${children.length} 项）</summary>${nodes}</details>`:(show.vids||[]).map(v=>`<div class="node file">${esc(v.name)}</div>`).join('')||'<div>暂无云端文件</div>'}</div></article>`;
     }).join('');
+    restoreTreeExpansion(container);
   }
 
   function render(){renderBanner();renderMetrics();renderProgress();renderInventoryProgress();renderTabs();renderTree();}
@@ -215,17 +234,26 @@
     return'暂时无法读取云盘清单，请稍后刷新';
   }
   async function refresh(){
+    if(refreshInFlight)return;
+    refreshInFlight=true;
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),REFRESH_TIMEOUT_MS);
     $('refresh').disabled=true;$('refresh').textContent='读取中…';
     let responseStatus=0,result=null;
     try{
-      const response=await fetch(`/api/data?t=${Date.now()}`,{cache:'no-store',credentials:'same-origin'});
+      const response=await fetch(`/api/data?t=${Date.now()}`,{cache:'no-store',credentials:'same-origin',signal:controller.signal});
       responseStatus=response.status;
       result=await response.json();
       if(!response.ok||result.error==='inventory_unavailable')throw new Error('unavailable');
       data=result;progressSnapshot=result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;unavailableMessage=null;render();
     }catch(error){data=null;unavailableMessage=unavailableCopy(result,responseStatus);progressSnapshot=result&&result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result&&result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;render();}
-    finally{$('refresh').disabled=false;$('refresh').textContent='刷新数据';}
+    finally{clearTimeout(timeout);refreshInFlight=false;$('refresh').disabled=false;$('refresh').textContent='刷新数据';}
   }
+  $('tree').addEventListener('toggle',event=>{
+    const details=event.target;
+    if(!details||details.tagName!=='DETAILS'||!details.dataset.expandKey)return;
+    if(details.open)expandedTreePaths.add(details.dataset.expandKey);else expandedTreePaths.delete(details.dataset.expandKey);
+  },true);
   $('tabs').addEventListener('click',event=>{const button=event.target.closest('[data-category]');if(!button)return;activeCategory=button.dataset.category;renderTabs();renderTree();});
   $('search').addEventListener('input',event=>{query=event.target.value.trim();renderTree();});
   $('refresh').addEventListener('click',refresh);
