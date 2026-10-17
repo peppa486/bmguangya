@@ -65,7 +65,7 @@ sudoedit /etc/bmguangya/config.json
 | `inventory.cloud_source` | `guangya_direct` 直接分页扫描光鸭目录，或 `alist` 通过 AList 文件 API 扫描。AList 挂载仍是凭据刷新和 STRM 播放所需依赖。 |
 | `reconcile.organize_unassigned` | 示例默认 `false`，先保守运行。用户已授权完整整理时可以设为 `true`，把可安全识别的未归类内容移动至“未标记/待核对”；不确定内容仍会留在原位。务必先看 dry-run 报告。 |
 | `reconcile.normalize_video_named_directories` | 默认 `true`。仅对唯一匹配番剧下、实际类型为目录且名称以视频扩展名结尾的直接子目录追加 `[资源包]`，可带 `(N)` 后缀；改名前核对完整子树，普通视频不改名。同名文件与目录造成路径歧义时跳过。已确认的目录重命名会更新中间库存路径，保留原始扫描时间戳，不把路径维护伪装成新的全盘扫描。 |
-| `reconcile.collapse_verified_duplicate_directories` | 默认 `false`，且需要 `organize_unassigned=true`。当一个子目录中的全部视频均为已证明相同内容的重复件、保留件全在目录外时，可整包收纳，保留字幕及辅助文件。移动前递归核对完整目录清单；任何新增、缺失或变化都会阻止整包移动。 |
+| `reconcile.collapse_verified_duplicate_directories` | 默认 `false`，且需要 `organize_unassigned=true`。当一个子目录中的全部视频均为已证明相同内容的重复件、保留件全在目录外时，可整包收纳。编号副本包若还有 Bonus、扫描图等内容，必须进一步证明同级保留包的全部相对路径、类型、每个文件的 GCID 和正大小均完全一致；移动前分别递归核对源包和保留包。任何新增、缺失或变化都会阻止整包移动。 |
 
 样例的 `dry_run` 保持 `true`，用于保护直接调用。仓库流水线单元会显式以 `--apply` 运行下载、整理和 STRM 同步；只有完成下方检查并由部署者启用 timer 后，定时器才会执行这些写操作。
 
@@ -138,6 +138,8 @@ cat /var/lib/bmguangya/strm-sync-report.json
 ```
 
 ## Jellyfin 与 VidHub
+
+同步前会用完整原始库存核对旧 STRM。受管 AList 地址中已不存在的云端路径，以及指向本轮新索引同一云文件的旧索引，会先校验并归档到媒体目录外；dry-run 列出候选和原因。其他来源、仍有效的独立资源、字幕和无法确认的链接会保留。
 
 1. 在 Jellyfin 建立一个媒体库，路径设为 `media_root`，使 Jellyfin 服务可以读取生成的 `.strm` 与 `tvshow.nfo`。STRM URL 使用配置中的 AList `public_url` 和 WebDAV 用户，所以 Jellyfin 服务及 VidHub 客户端都必须能够解析并访问该 URL。
 2. 在 Jellyfin 插件目录安装与你的 Jellyfin 版本兼容的 Bangumi 元数据插件，重启 Jellyfin，并按该插件当前文档配置 Bangumi 数据源/识别设置。生成的 NFO 包含 `uniqueid type="bangumi"` 和 Bangumi 条目 ID。插件是否识别该字段取决于插件版本与设置；检查实际刮削结果，不能仅凭 API 刷新成功判断刮削已完成。

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -142,7 +143,78 @@ def validate_inventory(inventory: dict[str, Any], config: dict[str, Any], *, now
     categories = [item.get("category") for item in tree if isinstance(item, dict)]
     if set(categories) != set(CATEGORIES) or len(categories) != len(CATEGORIES):
         raise SyncError("inventory tree must contain each of the four library categories exactly once")
+    _managed_inventory_file_paths(inventory, cfg_root)
     return freshness
+
+
+def _managed_inventory_file_paths(inventory: dict[str, Any], configured_root: tuple[str, ...]) -> set[str]:
+    """Return every file path relative to the configured cloud root.
+
+    This walks the original scanner tree, never the episode/show projection. A
+    malformed or partial source tree makes absence unprovable, so fail closed.
+    """
+    root = inventory.get("inventory_root")
+    if not isinstance(root, dict) or root.get("type") != "directory":
+        raise SyncError("inventory has no complete inventory_root directory tree")
+    if root.get("name") != configured_root[-1] or root.get("path") != "":
+        raise SyncError("inventory_root does not identify the configured cloud root")
+    if root.get("incomplete") is True or not isinstance(root.get("children"), list):
+        raise SyncError("inventory_root is incomplete or malformed")
+
+    files: set[str] = set()
+    raw_file_count = 0
+
+    def cloud_name(value: Any) -> str:
+        if (not isinstance(value, str) or not value or not value.strip()
+                or value in (".", "..") or "/" in value or "\\" in value or "\x00" in value
+                or any(ord(char) < 32 for char in value)):
+            raise SyncError("inventory_root contains an invalid path component")
+        return value
+
+    def visit(node: Any, parent_parts: tuple[str, ...]) -> None:
+        nonlocal raw_file_count
+        if not isinstance(node, dict) or node.get("incomplete") is True:
+            raise SyncError("inventory_root contains an incomplete or malformed node")
+        name = cloud_name(node.get("name"))
+        parts = (*parent_parts, name)
+        # The scanner stores paths relative to the configured root. Check any
+        # node's recorded path so the file set cannot be assembled from drifted
+        # or inconsistent parent/name fields.
+        expected_path = "/".join(parts[1:])
+        if node.get("path") != expected_path:
+            raise SyncError("inventory_root contains an inconsistent path")
+        kind = node.get("type")
+        if kind == "directory":
+            children = node.get("children")
+            if not isinstance(children, list):
+                raise SyncError("inventory_root directory has no complete children list")
+            for child in children:
+                if not isinstance(child, dict):
+                    raise SyncError("inventory_root contains a malformed child")
+                visit(child, parts)
+        elif kind == "file":
+            if "children" in node:
+                raise SyncError("inventory_root file contains child entries")
+            if not expected_path:
+                raise SyncError("inventory_root file has no relative path")
+            files.add(expected_path)
+            raw_file_count += 1
+        else:
+            raise SyncError("inventory_root contains an unknown node type")
+
+    # Root itself is represented by configured_root[-1] with path "".
+    # Descendant paths omit that root component.
+    for child in root["children"]:
+        if not isinstance(child, dict):
+            raise SyncError("inventory_root contains a malformed child")
+        visit(child, (configured_root[-1],))
+
+    counts = inventory.get("counts")
+    if isinstance(counts, dict) and "cloud_files" in counts:
+        declared = counts.get("cloud_files")
+        if isinstance(declared, bool) or not isinstance(declared, int) or declared != raw_file_count:
+            raise SyncError("inventory_root file count does not match inventory counts")
+    return files
 
 
 def _walk_file_nodes(nodes: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
@@ -603,6 +675,156 @@ def _target_file_rows(planned: list[dict[str, Any]], cfg: dict[str, Any]) -> lis
     return output
 
 
+def _origin_key(value: Any) -> tuple[str, int] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return None
+        if parsed.query or parsed.fragment or parsed.username or parsed.password:
+            return None
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == "https" else 80
+        return parsed.hostname.casefold(), port
+    except ValueError:
+        return None
+
+
+def _allowed_alist_origins(cfg: dict[str, Any]) -> set[tuple[str, int]]:
+    alist = cfg.get("alist")
+    if not isinstance(alist, dict):
+        return set()
+    origins = set()
+    for key in ("public_url", "api_base", "base_url", "url"):
+        origin = _origin_key(alist.get(key))
+        if origin is not None:
+            origins.add(origin)
+    return origins
+
+
+def _managed_cloud_path_from_url(value: str, cfg: dict[str, Any]) -> str | None:
+    """Map an exact managed /dav or /d URL to its inventory-relative cloud path."""
+    if not isinstance(value, str) or not value or any(char.isspace() or ord(char) < 32 for char in value):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return None
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == "https" else 80
+        if (parsed.hostname.casefold(), port) not in _allowed_alist_origins(cfg):
+            return None
+    except ValueError:
+        return None
+    raw_path = parsed.path
+    if not raw_path.startswith("/") or raw_path.startswith("//"):
+        return None
+    raw_parts = raw_path[1:].split("/")
+    if not raw_parts or any(not part or re.search(r"%(?![0-9a-fA-F]{2})", part) for part in raw_parts):
+        return None
+    try:
+        parts = [urllib.parse.unquote_to_bytes(part).decode("utf-8", errors="strict") for part in raw_parts]
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if any(part in ("", ".", "..") or "/" in part or "\\" in part
+           or any(ord(char) < 32 for char in part) for part in parts):
+        return None
+    if not parts or parts[0] not in ("dav", "d"):
+        return None
+    route_root = [cfg["stream_mount"], *cfg["root_suffix"]]
+    if parts[1:1 + len(route_root)] != route_root:
+        return None
+    relative_parts = parts[1 + len(route_root):]
+    if not relative_parts:
+        return None
+    try:
+        return "/".join(clean_relative_path("/".join(relative_parts), field="STRM URL path"))
+    except SyncError:
+        return None
+
+
+def _single_line_strm_url(path: Path) -> str | None:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_size > 65536:
+            return None
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise SyncError("cannot inspect a local STRM index") from exc
+    if payload.endswith(b"\r\n"):
+        payload = payload[:-2]
+    elif payload.endswith(b"\n"):
+        payload = payload[:-1]
+    if not payload or b"\n" in payload or b"\r" in payload:
+        return None
+    try:
+        value = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if not value or value != value.strip():
+        return None
+    return value
+
+
+def _managed_stale_strm_candidates(cfg: dict[str, Any], inventory: dict[str, Any],
+                                   output_files: list[tuple[Path, bytes, str]], *,
+                                   now: dt.datetime | None = None) -> dict[Path, str]:
+    """Find only managed links to missing cloud files or duplicate desired targets."""
+    validate_inventory(inventory, {"alist": cfg["alist"]}, now=now)
+    live_cloud_files = _managed_inventory_file_paths(inventory, normalize_root(
+        cfg["alist"].get("root"), field="alist.root"))
+    desired = {target for target, _body, _kind in output_files}
+    desired_cloud_paths: set[str] = set()
+    for _target, body, kind in output_files:
+        if kind != "strm":
+            continue
+        try:
+            value = body.decode("utf-8", errors="strict").removesuffix("\n")
+        except UnicodeDecodeError as exc:
+            raise SyncError("generated STRM URL is malformed") from exc
+        cloud_path = _managed_cloud_path_from_url(value, cfg)
+        if cloud_path is None:
+            raise SyncError("generated STRM URL is outside the configured AList root")
+        if cloud_path not in live_cloud_files:
+            raise SyncError("planned STRM source is absent from the complete inventory_root")
+        desired_cloud_paths.add(cloud_path)
+
+    media_root = cfg["media_root"]
+    _assert_no_symlink_ancestors(media_root, field="media_root")
+    if not media_root.exists():
+        return {}
+    if not media_root.is_dir():
+        raise SyncError("media_root is not a directory")
+    candidates: dict[Path, str] = {}
+
+    def walk_error(exc: OSError) -> None:
+        raise SyncError("cannot inspect the Jellyfin media tree") from exc
+
+    for directory, dirnames, filenames in os.walk(media_root, followlinks=False, onerror=walk_error):
+        base = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
+        for filename in filenames:
+            path = base / filename
+            if path.suffix.lower() != ".strm" or path in desired or path.is_symlink():
+                continue
+            value = _single_line_strm_url(path)
+            if value is None:
+                continue
+            cloud_path = _managed_cloud_path_from_url(value, cfg)
+            if cloud_path is None:
+                continue
+            if cloud_path in desired_cloud_paths:
+                candidates[path] = "duplicate_desired_cloud_file"
+            elif cloud_path not in live_cloud_files:
+                candidates[path] = "cloud_file_missing"
+    return candidates
+
+
 def make_show_nfo(subject_id: str, title: str) -> bytes:
     root = ET.Element("tvshow")
     ET.SubElement(root, "title").text = title
@@ -648,7 +870,7 @@ def _stage_file(target: Path, body: bytes) -> Path:
 
 
 def _archive_candidates(media_root: Path, archive_root: Path, desired: set[Path],
-                        cleanup_roots: set[Path]) -> list[tuple[Path, Path]]:
+                        cleanup_roots: set[Path], *, extra_files: set[Path] | None = None) -> list[tuple[Path, Path]]:
     _assert_no_symlink_ancestors(media_root, field="media_root")
     _assert_no_symlink_ancestors(archive_root, field="archive_root")
     if archive_root == media_root or media_root in archive_root.parents or archive_root in media_root.parents:
@@ -679,6 +901,19 @@ def _archive_candidates(media_root: Path, archive_root: Path, desired: set[Path]
                     raise SyncError("refusing to archive a symlink or non-file index: {}".format(path))
                 if path.suffix.lower() == ".strm" or _is_bangumi_nfo(path):
                     files.add(path)
+    for source in extra_files or set():
+        try:
+            source.relative_to(media_root)
+        except ValueError as exc:
+            raise SyncError("archive candidate escapes the Jellyfin media root") from exc
+        if source in desired:
+            continue
+        if source.suffix.lower() != ".strm":
+            raise SyncError("managed stale-index candidate is not a STRM file")
+        _assert_no_symlink_ancestors(source, field="archive candidate")
+        if source.is_symlink() or not source.is_file():
+            raise SyncError("refusing to archive a symlink or non-file index")
+        files.add(source)
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     rows = []
     for source in sorted(files):
@@ -831,19 +1066,28 @@ def _prune_empty_index_directories(paths: Iterable[Path], media_root: Path) -> N
             directory = directory.parent
 
 
-def apply_plan(planned: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
+def apply_plan(planned: list[dict[str, Any]], cfg: dict[str, Any], *,
+               inventory: dict[str, Any] | None = None,
+               now: dt.datetime | None = None) -> dict[str, Any]:
     output_files = _target_file_rows(planned, cfg)
     desired = {target for target, _body, _kind in output_files}
+    stale_strms = (_managed_stale_strm_candidates(cfg, inventory, output_files, now=now)
+                   if inventory is not None else {})
     staged: list[tuple[Path, Path, str]] = []
     try:
         for target, body, kind in output_files:
             staged.append((target, _stage_file(target, body), kind))
         cleanup_roots = _cleanup_roots(planned, cfg)
-        old_indexes = _archive_candidates(cfg["media_root"], cfg["archive_root"], desired, cleanup_roots)
+        old_indexes = _archive_candidates(cfg["media_root"], cfg["archive_root"], desired, cleanup_roots,
+                                          extra_files=set(stale_strms))
         archived = []
+        archived_stale = []
         for source, destination in old_indexes:
             _copy_to_archive(source, destination)
             archived.append({"from": str(source), "to": str(destination)})
+            if source in stale_strms:
+                archived_stale.append({"from": str(source), "to": str(destination),
+                                       "reason": stale_strms[source]})
         _prune_empty_index_directories((source for source, _destination in old_indexes), cfg["media_root"])
         created = updated = unchanged = 0
         desired_by_target = {(target, kind): body for target, body, kind in output_files}
@@ -867,7 +1111,9 @@ def apply_plan(planned: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, 
                 else:
                     created += 1
         return {"created": created, "updated": updated, "unchanged": unchanged,
-                "archived": archived, "archive_count": len(archived), "files_written": len(output_files)}
+                "archived": archived, "archive_count": len(archived), "files_written": len(output_files),
+                "managed_stale_strm_archives": archived_stale,
+                "managed_stale_strm_archive_count": len(archived_stale)}
     finally:
         for _target, temp, _kind in staged:
             try:
@@ -958,6 +1204,8 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
         report["inventory_generated_at"] = inventory.get("generated_at") or inventory.get("updated_at")
         report["freshness"] = validate_inventory(inventory, config, now=now)
         planned, unresolved, conflicts = build_show_plan(inventory, cfg)
+        output_files = _target_file_rows(planned, cfg)
+        stale_strms = _managed_stale_strm_candidates(cfg, inventory, output_files, now=now)
         excluded_review_groups: dict[str, dict[str, Any]] = {}
         skipped_review_files: set[str] = set()
         for show in planned:
@@ -975,6 +1223,11 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
             "planned_strm_count": sum(len(show["episodes"]) for show in planned),
             "planned_nfo_count": sum(1 for show in planned if show["nfo_title"] is not None),
             "skipped_review_files": len(skipped_review_files),
+            "managed_stale_strm_archive_candidate_count": len(stale_strms),
+            "managed_stale_strm_archive_candidates": [
+                {"path": path.relative_to(cfg["media_root"]).as_posix(), "reason": reason}
+                for path, reason in sorted(stale_strms.items())
+            ],
             "excluded_review_paths": [
                 {"path": root, "inventory_show_paths": sorted(group["inventory_show_paths"]),
                  "video_file_count": len(group["video_files"])}
@@ -990,7 +1243,7 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
             ],
         })
         if apply:
-            report["apply_stats"] = apply_plan(planned, cfg)
+            report["apply_stats"] = apply_plan(planned, cfg, inventory=inventory, now=now)
             # A successful disk write is reported separately from Jellyfin's verified refresh POST.
             report["applied"] = True
             report["jellyfin_refresh"] = refresh_jellyfin(cfg)
@@ -1016,7 +1269,8 @@ def main(argv: list[str] | None = None) -> int:
     report, code = run(args.config, args.inventory, args.report, apply=bool(args.apply))
     summary = {key: report.get(key) for key in (
         "status", "mode", "applied", "show_count", "planned_strm_count", "planned_nfo_count",
-        "skipped_review_files", "excluded_review_paths", "unresolved", "error", "jellyfin_refresh",
+        "skipped_review_files", "managed_stale_strm_archive_candidate_count",
+        "excluded_review_paths", "unresolved", "error", "jellyfin_refresh",
     ) if key in report}
     print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
     return code

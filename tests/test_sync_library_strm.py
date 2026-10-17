@@ -68,7 +68,43 @@ def show(*, matched: bool = True, episode_key: str = "EP01") -> dict:
     }
 
 
-def inventory(*shows: dict) -> dict:
+def inventory_root_for(paths: list[str]) -> dict:
+    root = {"name": "Anime", "type": "directory", "path": "", "children": []}
+
+    def child(parent: dict, name: str, kind: str, relative: str) -> dict:
+        found = next((row for row in parent["children"]
+                      if row.get("name") == name and row.get("type") == kind), None)
+        if found is not None:
+            return found
+        row = {"name": name, "type": kind, "path": relative}
+        if kind == "directory":
+            row.update({"children": [], "empty": True})
+        else:
+            row["size"] = 100
+        parent["children"].append(row)
+        return row
+
+    for value in sorted(set(paths)):
+        parts = value.split("/")
+        if not parts or any(part in ("", ".", "..") for part in parts):
+            raise ValueError("invalid fixture cloud path")
+        parent = root
+        relative_parts = []
+        for part in parts[:-1]:
+            relative_parts.append(part)
+            parent = child(parent, part, "directory", "/".join(relative_parts))
+            parent["empty"] = False
+        relative_parts.append(parts[-1])
+        child(parent, parts[-1], "file", "/".join(relative_parts))
+    return root
+
+
+def inventory(*shows: dict, cloud_files: tuple[str, ...] = ()) -> dict:
+    paths = list(cloud_files)
+    for item in shows:
+        for video in item.get("vids", []):
+            if isinstance(video, dict) and isinstance(video.get("relative_path"), str):
+                paths.append(video["relative_path"])
     return {
         "complete": True,
         "generated_at": NOW.isoformat(),
@@ -76,6 +112,7 @@ def inventory(*shows: dict) -> dict:
         "freshness": {"state": "fresh", "age_seconds": 0, "ttl_seconds": 900},
         "errors": [],
         "source": {"cloud_root": "/guangya/Anime", "cloud_refresh": True},
+        "inventory_root": inventory_root_for(paths),
         "tree": [
             {"category": category, "shows": list(shows) if category == "在看" else []}
             for category in sync.CATEGORIES
@@ -261,6 +298,10 @@ class SyncLibraryStrmTests(unittest.TestCase):
             next(section for section in inv["tree"] if section["category"] == "未标记")["shows"] = [
                 review, review_descendant, regular_unmatched,
             ]
+            inv["inventory_root"] = inventory_root_for([
+                *(video["relative_path"] for item in (review, review_descendant, regular_unmatched)
+                  for video in item["vids"]),
+            ])
 
             config_path = root / "config.json"
             inventory_path = root / "library.json"
@@ -523,6 +564,174 @@ class SyncLibraryStrmTests(unittest.TestCase):
             self.assertTrue(report_path.is_file())
             self.assertNotIn("do-not-print-me", report_path.read_text(encoding="utf-8"))
             refresh.assert_called_once()
+
+    def test_dry_run_lists_and_apply_archives_managed_strm_to_missing_cloud_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            archive = root / "archive"
+            raw = config(media, archive)
+            cfg = sync.validate_config(raw)
+            inv = inventory(show())
+            stale = media / "Old category" / "Old title" / "EP01.strm"
+            stale.parent.mkdir(parents=True)
+            stale.write_text(sync.authenticated_strm_url(
+                cfg, "在看/Renamed by cleanup/EP01.mkv"
+            ) + "\n", encoding="utf-8")
+            config_path = root / "config.json"
+            inventory_path = root / "library.json"
+            report_path = root / "report.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            inventory_path.write_text(json.dumps(inv, ensure_ascii=False), encoding="utf-8")
+
+            preview, code = sync.run(config_path, inventory_path, report_path, apply=False, now=NOW)
+            self.assertEqual(code, 0)
+            self.assertEqual(preview["managed_stale_strm_archive_candidates"], [{
+                "path": "Old category/Old title/EP01.strm", "reason": "cloud_file_missing",
+            }])
+            self.assertTrue(stale.is_file())
+            self.assertNotIn("s3cret", report_path.read_text(encoding="utf-8"))
+
+            with patch.object(sync, "refresh_jellyfin", return_value={
+                "requested": True, "status_code": 204, "verified": True,
+            }):
+                result, apply_code = sync.run(config_path, inventory_path, report_path, apply=True, now=NOW)
+            self.assertEqual(apply_code, 0)
+            self.assertFalse(stale.exists())
+            self.assertEqual(result["apply_stats"]["managed_stale_strm_archive_count"], 1)
+            archived = list(archive.rglob("EP01.strm"))
+            self.assertEqual(len(archived), 1)
+            self.assertNotIn("s3cret", report_path.read_text(encoding="utf-8"))
+
+    def test_valid_unknown_actual_cloud_file_is_kept_from_full_inventory_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            cfg = sync.validate_config(config(media, root / "archive"))
+            unknown_cloud_path = "未标记/coverage unknown/EP77.mkv"
+            inv = inventory(show(), cloud_files=(unknown_cloud_path,))
+            local = media / "Legacy" / "EP77.strm"
+            local.parent.mkdir(parents=True)
+            local.write_text(sync.authenticated_strm_url(cfg, unknown_cloud_path) + "\n", encoding="utf-8")
+            planned, _unresolved, _conflicts = sync.build_show_plan(inv, cfg)
+
+            sync.apply_plan(planned, cfg, inventory=inv, now=NOW)
+
+            self.assertTrue(local.is_file())
+            self.assertEqual(list((root / "archive").rglob("EP77.strm")), [])
+
+    def test_inventory_root_same_name_file_and_directory_is_retained_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            cfg = sync.validate_config(config(media, root / "archive"))
+            ambiguous_path = "在看/回转企鹅罐/EP01.mkv"
+            inv = inventory(show(), cloud_files=(
+                ambiguous_path,
+                ambiguous_path + "/inner-video.mkv",
+            ))
+            ambiguous_dir = next(
+                node for node in inv["inventory_root"]["children"][0]["children"]
+                if node["path"] == "在看/回转企鹅罐"
+            )
+            ambiguous_file = next(node for node in ambiguous_dir["children"]
+                                  if node["name"] == "EP01.mkv" and node["type"] == "file")
+            ambiguous_dir["children"].append(copy.deepcopy(ambiguous_file))
+            # EP01.mkv is both a file and a directory, and the file path has a
+            # duplicate row: compare raw file-node count, not unique path count.
+            inv["counts"] = {"cloud_files": 4}
+            stale_local = media / "Legacy wrapper" / "EP01.strm"
+            stale_local.parent.mkdir(parents=True)
+            stale_local.write_text(sync.authenticated_strm_url(cfg, ambiguous_path) + "\n", encoding="utf-8")
+            planned, _unresolved, _conflicts = sync.build_show_plan(inv, cfg)
+
+            sync.validate_inventory(inv, {"alist": cfg["alist"]}, now=NOW)
+            sync.apply_plan(planned, cfg, inventory=inv, now=NOW)
+
+            self.assertTrue(stale_local.is_file())
+            self.assertEqual(list((root / "archive").rglob("EP01.strm")), [])
+
+    def test_duplicate_local_index_to_desired_cloud_file_archived_but_other_live_path_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            archive = root / "archive"
+            raw = config(media, archive)
+            # Old local links may use the configured API host and AList's /d route.
+            raw["alist"]["api_base"] = "http://127.0.0.1:5244/api/v3"
+            cfg = sync.validate_config(raw)
+            other_cloud_path = "想看/Other show/EP02.mkv"
+            inv = inventory(show(), cloud_files=(other_cloud_path,))
+            duplicate = media / "Legacy title" / "EP01.strm"
+            separate_live = media / "Legacy title" / "EP02.strm"
+            duplicate.parent.mkdir(parents=True)
+            duplicate_url = sync.authenticated_strm_url(cfg, MEDIA_REL).replace("/dav/", "/d/", 1)
+            duplicate_url += "?sign=private-signature"
+            live_url = sync.authenticated_strm_url(cfg, other_cloud_path).replace("/dav/", "/d/", 1)
+            duplicate.write_text(duplicate_url + "\n", encoding="utf-8")
+            separate_live.write_text(live_url + "\n", encoding="utf-8")
+            planned, _unresolved, _conflicts = sync.build_show_plan(inv, cfg)
+
+            stats = sync.apply_plan(planned, cfg, inventory=inv, now=NOW)
+
+            self.assertFalse(duplicate.exists())
+            self.assertTrue(separate_live.is_file())
+            self.assertEqual(stats["managed_stale_strm_archive_count"], 1)
+            self.assertEqual(stats["managed_stale_strm_archives"][0]["reason"], "duplicate_desired_cloud_file")
+            self.assertNotIn("private-signature", json.dumps(stats))
+
+    def test_wrong_host_root_multiline_and_symlink_strms_are_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            cfg = sync.validate_config(config(media, root / "archive"))
+            local = media / "Legacy"
+            local.mkdir(parents=True)
+            wrong_host = local / "wrong-host.strm"
+            wrong_root = local / "wrong-root.strm"
+            multiline = local / "multiline.strm"
+            wrong_host.write_text("http://evil.invalid:5244/dav/guangya/Anime/missing.mkv\n", encoding="utf-8")
+            wrong_root.write_text("http://127.0.0.1:5244/dav/guangya/Elsewhere/missing.mkv\n", encoding="utf-8")
+            managed_missing = sync.authenticated_strm_url(cfg, "想看/No longer there.mkv")
+            multiline.write_text(managed_missing + "\n# extra line\n", encoding="utf-8")
+            subtitle = local / "EP01.ass"
+            subtitle.write_text("subtitle", encoding="utf-8")
+            target = root / "symlink-target.txt"
+            target.write_text(managed_missing + "\n", encoding="utf-8")
+            symlink = local / "symlink.strm"
+            try:
+                symlink.symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("file symlinks are unavailable on this platform")
+            inv = inventory()
+
+            sync.apply_plan([], cfg, inventory=inv, now=NOW)
+
+            self.assertTrue(wrong_host.is_file())
+            self.assertTrue(wrong_root.is_file())
+            self.assertTrue(multiline.is_file())
+            self.assertTrue(subtitle.is_file())
+            self.assertTrue(symlink.is_symlink())
+
+    def test_incomplete_or_stale_inventory_blocks_stale_strm_archival(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "media"
+            cfg = sync.validate_config(config(media, root / "archive"))
+            stale = media / "Legacy" / "EP01.strm"
+            stale.parent.mkdir(parents=True)
+            stale.write_text(sync.authenticated_strm_url(cfg, "在看/removed/EP01.mkv") + "\n", encoding="utf-8")
+            complete = inventory()
+            incomplete = copy.deepcopy(complete)
+            incomplete["complete"] = False
+            outdated = copy.deepcopy(complete)
+            outdated["generated_at"] = (NOW - dt.timedelta(seconds=901)).isoformat()
+
+            for invalid in (incomplete, outdated):
+                with self.subTest(complete=invalid["complete"], generated_at=invalid["generated_at"]):
+                    with self.assertRaises(sync.SyncError):
+                        sync.apply_plan([], cfg, inventory=invalid, now=NOW)
+                    self.assertTrue(stale.is_file())
 
     def test_archive_root_must_be_disjoint_from_media(self):
         with tempfile.TemporaryDirectory() as tmp:

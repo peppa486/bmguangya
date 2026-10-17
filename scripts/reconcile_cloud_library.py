@@ -27,6 +27,7 @@ SCHEMA_VERSION = 1
 DEFAULT_INVENTORY = "/var/lib/bmguangya/library.json"
 DEFAULT_REPORT = "/var/lib/bmguangya/reconcile-cloud-library.json"
 DEFAULT_ALIST_ROOT = "/guangya/Anime"
+EMPTY_FILE_SHA1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
 VIDEO_SUFFIXES = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".m2ts", ".ts",
     ".webm", ".mpg", ".mpeg", ".3gp", ".ogv", ".vob", ".m4v",
@@ -401,13 +402,29 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
     except ReconcileError:
         return [], [], set()
 
-    same_title = [candidate for _, candidate in all_shows
-                  if str(candidate.get("name") or "") == show_name
-                  and str(candidate.get("subject_id") or "") != subject_id]
-    title_component = show_name
-    if same_title:
-        title_component += " [bgm-{}]".format(subject_id)
-    target_directory = "未标记/待核对-重复内容/" + title_component
+    # The display title is metadata and may contain path separators. Use the
+    # validated cloud basename so a review bucket is always one path component.
+    bucket_component = show_parts[-1]
+    same_basename_other_subject = False
+    for _, candidate in all_shows:
+        candidate_subject_id = candidate.get("subject_id")
+        candidate_path = candidate.get("source_path")
+        if candidate_subject_id is None or str(candidate_subject_id) == subject_id:
+            continue
+        try:
+            candidate_parts = _clean_relative_path(candidate_path, field="show.source_path")
+        except ReconcileError:
+            continue
+        if candidate_parts[-1].casefold() == bucket_component.casefold():
+            same_basename_other_subject = True
+            break
+    if same_basename_other_subject:
+        # Bangumi IDs are normally numeric, but keep even malformed metadata
+        # from introducing another path component.
+        safe_subject_id = (subject_id if re.fullmatch(r"[A-Za-z0-9._-]+", subject_id)
+                           else "id-" + hashlib.sha256(subject_id.encode("utf-8")).hexdigest()[:12])
+        bucket_component += " [bgm-{}]".format(safe_subject_id)
+    target_directory = "未标记/待核对-重复内容/" + bucket_component
     try:
         _clean_relative_path(target_directory, field="duplicate-content target directory")
     except ReconcileError as exc:
@@ -746,6 +763,12 @@ def _directory_manifest_from_inventory(node: dict) -> Optional[List[dict]]:
             size = child.get("size") if kind == "file" else None
             if size is not None and (isinstance(size, (dict, list)) or isinstance(size, bool)):
                 return False
+            gcid = _normalize_gcid(child.get("gcid")) if kind == "file" else None
+            # GuangYa's inventory endpoint reports empty text files with their
+            # empty-content SHA-1 but no size. Derive zero only from that exact
+            # content proof; leave all other unknown sizes unknown.
+            if kind == "file" and size is None and gcid == EMPTY_FILE_SHA1:
+                size = 0
             seen_paths.add(relative)
             seen_ids.add(file_id)
             manifest.append({
@@ -753,7 +776,7 @@ def _directory_manifest_from_inventory(node: dict) -> Optional[List[dict]]:
                 "type": kind,
                 "file_id": file_id,
                 "size": size,
-                "gcid": _normalize_gcid(child.get("gcid")) if kind == "file" else None,
+                "gcid": gcid,
             })
             if kind == "directory" and not visit(child, relative, depth + 1):
                 return False
@@ -913,6 +936,9 @@ def _live_directory_manifest(client: "AListClient", directory_path: str) -> List
             if raw_gcid not in (None, "") and _normalize_gcid(raw_gcid) is None:
                 raise ReconcileError("live directory entry has an invalid GCID",
                                      code="directory_manifest_unreadable")
+            gcid = _normalize_gcid(raw_gcid) if kind == "file" else None
+            if kind == "file" and size is None and gcid == EMPTY_FILE_SHA1:
+                size = 0
             seen_paths.add(relative)
             seen_ids.add(file_id)
             manifest.append({
@@ -920,7 +946,7 @@ def _live_directory_manifest(client: "AListClient", directory_path: str) -> List
                 "type": kind,
                 "file_id": file_id,
                 "size": size,
-                "gcid": _normalize_gcid(raw_gcid) if kind == "file" else None,
+                "gcid": gcid,
             })
             if kind == "directory":
                 visit(path.rstrip("/") + "/" + name, relative, depth + 1)
