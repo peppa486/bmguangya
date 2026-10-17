@@ -136,6 +136,13 @@ def normalize_config(raw: dict) -> dict:
     organize_unassigned = reconcile.get("organize_unassigned", raw.get("organize_unassigned", False))
     if not isinstance(organize_unassigned, bool):
         raise ReconcileError("reconcile.organize_unassigned must be a boolean", code="invalid_config")
+    collapse_duplicate_directories = reconcile.get(
+        "collapse_verified_duplicate_directories",
+        raw.get("collapse_verified_duplicate_directories", False),
+    )
+    if not isinstance(collapse_duplicate_directories, bool):
+        raise ReconcileError("reconcile.collapse_verified_duplicate_directories must be a boolean",
+                             code="invalid_config")
     if not Path(str(inventory_path)).is_absolute() or not Path(str(report_path)).is_absolute():
         raise ReconcileError("inventory and report paths must be absolute", code="invalid_config")
     return {
@@ -153,6 +160,7 @@ def normalize_config(raw: dict) -> dict:
         "inventory_max_age_seconds": int(_first(reconcile.get("max_inventory_age_seconds"),
                                                   inventory.get("freshness_ttl_seconds"), 900)),
         "organize_unassigned": organize_unassigned,
+        "collapse_verified_duplicate_directories": collapse_duplicate_directories,
     }
 
 
@@ -676,6 +684,381 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
     return directory_actions + actions, issues, handled_keys
 
 
+def _directory_manifest_from_inventory(node: dict) -> Optional[List[dict]]:
+    """Return a complete, identity-backed manifest for a directory subtree."""
+    manifest: List[dict] = []
+    seen_paths = set()
+    seen_ids = set()
+
+    def visit(directory: dict, prefix: str, depth: int = 0) -> bool:
+        if (depth > 256 or directory.get("incomplete") or directory.get("complete") is False
+                or not isinstance(directory.get("children"), list)):
+            return False
+        for child in directory["children"]:
+            name = child.get("name")
+            if (not isinstance(name, str) or not name or name in (".", "..")
+                    or "/" in name or "\\" in name):
+                return False
+            kind = "directory" if _is_dir(child) else "file"
+            if child.get("type") not in ("directory", "file"):
+                return False
+            relative = "/".join(filter(None, (prefix, name)))
+            try:
+                _clean_relative_path(relative, field="directory manifest path")
+            except ReconcileError:
+                return False
+            file_id = _file_id(child)
+            if not file_id or relative in seen_paths or file_id in seen_ids:
+                return False
+            size = child.get("size") if kind == "file" else None
+            if size is not None and (isinstance(size, (dict, list)) or isinstance(size, bool)):
+                return False
+            seen_paths.add(relative)
+            seen_ids.add(file_id)
+            manifest.append({
+                "relative_path": relative,
+                "type": kind,
+                "file_id": file_id,
+                "size": size,
+                "gcid": _normalize_gcid(child.get("gcid")) if kind == "file" else None,
+            })
+            if kind == "directory" and not visit(child, relative, depth + 1):
+                return False
+        return True
+
+    if not visit(node, ""):
+        return None
+    manifest.sort(key=lambda row: (row["relative_path"].casefold(), row["relative_path"], row["type"]))
+    return manifest if manifest else None
+
+
+def _live_directory_manifest(client: "AListClient", directory_path: str) -> List[dict]:
+    """Read a fresh recursive manifest, failing closed on any incomplete listing."""
+    manifest: List[dict] = []
+    seen_paths = set()
+    seen_ids = set()
+
+    def visit(path: str, prefix: str, depth: int = 0) -> None:
+        if depth > 256:
+            raise ReconcileError("live directory nesting exceeds the manifest safety limit",
+                                 code="directory_manifest_unreadable")
+        rows = client.list_all(path, refresh=True)
+        names = set()
+        for child in rows:
+            name = child.get("name")
+            if (not isinstance(name, str) or not name or name in (".", "..")
+                    or "/" in name or "\\" in name):
+                raise ReconcileError("live directory contains an unsafe child name",
+                                     code="directory_manifest_unreadable")
+            if name.casefold() in names:
+                raise ReconcileError("live directory contains duplicate child names",
+                                     code="directory_manifest_unreadable")
+            names.add(name.casefold())
+            kind = "directory" if _is_dir(child) else "file"
+            if kind == "file" and child.get("is_dir") is not False and child.get("type") != "file":
+                raise ReconcileError("live directory contains an unknown entry type",
+                                     code="directory_manifest_unreadable")
+            relative = "/".join(filter(None, (prefix, name)))
+            try:
+                _clean_relative_path(relative, field="live directory manifest path")
+            except ReconcileError as exc:
+                raise ReconcileError(str(exc), code="directory_manifest_unreadable") from exc
+            file_id = _file_id(child)
+            if not file_id or relative in seen_paths or file_id in seen_ids:
+                raise ReconcileError("live directory entry has a missing or duplicate identity",
+                                     code="directory_manifest_unreadable")
+            size = child.get("size") if kind == "file" else None
+            if size is not None and (isinstance(size, (dict, list)) or isinstance(size, bool)):
+                raise ReconcileError("live directory entry has an invalid size",
+                                     code="directory_manifest_unreadable")
+            raw_gcid = child.get("gcid") if kind == "file" else None
+            if raw_gcid not in (None, "") and _normalize_gcid(raw_gcid) is None:
+                raise ReconcileError("live directory entry has an invalid GCID",
+                                     code="directory_manifest_unreadable")
+            seen_paths.add(relative)
+            seen_ids.add(file_id)
+            manifest.append({
+                "relative_path": relative,
+                "type": kind,
+                "file_id": file_id,
+                "size": size,
+                "gcid": _normalize_gcid(raw_gcid) if kind == "file" else None,
+            })
+            if kind == "directory":
+                visit(path.rstrip("/") + "/" + name, relative, depth + 1)
+
+    visit(directory_path, "")
+    manifest.sort(key=lambda row: (row["relative_path"].casefold(), row["relative_path"], row["type"]))
+    return manifest
+
+
+def _verify_live_directory_manifest(client: "AListClient", action: dict,
+                                    current_name: str) -> Tuple[bool, str, str]:
+    expected = action.get("directory_manifest")
+    if not isinstance(expected, list):
+        return False, "directory_manifest_invalid", "planned directory manifest is missing or invalid"
+    source_path = action["source_dir"].rstrip("/") + "/" + current_name
+    try:
+        live = _live_directory_manifest(client, source_path)
+    except ReconcileError as exc:
+        return False, exc.code, str(exc)
+    if len(live) != len(expected):
+        return False, "directory_manifest_changed", "live subtree entry count differs from the planned manifest"
+    expected_by_path = {row.get("relative_path"): row for row in expected if isinstance(row, dict)}
+    live_by_path = {row["relative_path"]: row for row in live}
+    if len(expected_by_path) != len(expected) or set(expected_by_path) != set(live_by_path):
+        return False, "directory_manifest_changed", "live subtree paths differ from the planned manifest"
+    for relative, planned in expected_by_path.items():
+        current = live_by_path[relative]
+        for key in ("type", "file_id", "size"):
+            if planned.get(key) != current.get(key):
+                return False, "directory_manifest_changed", "live subtree {} changed at {}".format(key, relative)
+        # Some AList list responses omit GCID. If a valid live value is present,
+        # require it to equal the original inventory value (including unknown).
+        if current.get("gcid") is not None and current.get("gcid") != planned.get("gcid"):
+            return False, "directory_manifest_changed", "live subtree GCID changed at {}".format(relative)
+    return True, "", ""
+
+
+def _collapse_verified_duplicate_directories(inventory: dict, cfg: dict,
+                                            duplicate_actions: List[dict],
+                                            other_actions: Sequence[dict],
+                                            matched_roots: Sequence[Tuple[str, str]]) -> Tuple[List[dict], Dict[str, dict]]:
+    """Replace per-file duplicate moves with a directory move when every video is proven safe."""
+    root = inventory["inventory_root"]
+    video_actions: Dict[str, Dict[str, List[dict]]] = {}
+    subtitle_actions: Dict[str, List[dict]] = {}
+    for action in duplicate_actions:
+        role = action.get("role")
+        subject_id = str(action.get("subject_id") or "")
+        source = action.get("source_relative_path")
+        if role == "duplicate_content_video" and isinstance(source, str):
+            video_actions.setdefault(subject_id, {}).setdefault(source, []).append(action)
+        elif role == "duplicate_content_subtitle":
+            subtitle_actions.setdefault(subject_id, []).append(action)
+
+    other_sources = []
+    for action in other_actions:
+        source = action.get("source_relative_path")
+        if isinstance(source, str):
+            try:
+                parts = _clean_relative_path(source, field="planned source path")
+            except ReconcileError:
+                continue
+            other_sources.append((parts, action.get("source_kind") == "directory"))
+
+    candidates = []
+    for subject_id, show_relative in matched_roots:
+        try:
+            show_parts = _clean_relative_path(show_relative, field="matched show path")
+        except ReconcileError:
+            continue
+        for directory in _walk_directories(root):
+            relative = directory.get("_relative_path")
+            if not isinstance(relative, str):
+                continue
+            try:
+                directory_parts = _clean_relative_path(relative, field="duplicate directory path")
+            except ReconcileError:
+                continue
+            if len(directory_parts) <= len(show_parts) or directory_parts[:len(show_parts)] != show_parts:
+                continue
+            nested_show = False
+            for _, other_show in _iter_shows(inventory):
+                other_path = other_show.get("source_path")
+                if not isinstance(other_path, str) or other_path == show_relative:
+                    continue
+                try:
+                    other_parts = _clean_relative_path(other_path, field="nested show path")
+                except ReconcileError:
+                    continue
+                if other_parts[:len(directory_parts)] == directory_parts:
+                    nested_show = True
+                    break
+            if nested_show:
+                continue
+            directory_id = _file_id(directory)
+            manifest = _directory_manifest_from_inventory(directory) if directory_id else None
+            if manifest is None:
+                continue
+
+            subtree_files = []
+            for node in _walk_files(directory):
+                path = relative + "/" + node["_relative_path"]
+                subtree_files.append((node, path))
+            subtree_video_rows = [(node, path) for node, path in subtree_files
+                                  if PurePosixPath(node.get("name") or "").suffix.lower() in VIDEO_SUFFIXES]
+            if not subtree_video_rows:
+                continue
+
+            covered_videos = []
+            valid = True
+            subject_video_actions = video_actions.get(str(subject_id), {})
+            for node, path in subtree_video_rows:
+                matches = subject_video_actions.get(path, [])
+                if (len(matches) != 1 or matches[0].get("state") != "planned"
+                        or matches[0].get("file_id") != _file_id(node)
+                        or _path_is_within(matches[0].get("kept_relative_path"), relative)):
+                    valid = False
+                    break
+                covered_videos.append(matches[0])
+            if not valid:
+                continue
+
+            covered_video_ids = {action["action_id"] for action in covered_videos}
+            covered_actions = list(covered_videos)
+            for subtitle in subtitle_actions.get(str(subject_id), []):
+                if subtitle.get("requires_verified_video") not in covered_video_ids:
+                    continue
+                if not _path_is_within(subtitle.get("source_relative_path"), relative):
+                    valid = False
+                    break
+                covered_actions.append(subtitle)
+            if not valid:
+                continue
+
+            covered_ids = {action["action_id"] for action in covered_actions}
+            for action in duplicate_actions:
+                source = action.get("source_relative_path")
+                if (_path_is_within(source, relative) and action.get("action_id") not in covered_ids):
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+            # Any ordinary, range, or other organization action overlapping this
+            # directory means that moving the whole tree would swallow its work.
+            for source_parts, source_is_directory in other_sources:
+                if (source_parts[:len(directory_parts)] == directory_parts
+                        or (source_is_directory and directory_parts[:len(source_parts)] == source_parts)):
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+            target_directories = {action.get("target_dir_relative") for action in covered_actions}
+            dependencies = {action.get("requires_directory") for action in covered_actions}
+            if len(target_directories) != 1 or len(dependencies) != 1:
+                continue
+            target_directory = next(iter(target_directories))
+            if not isinstance(target_directory, str):
+                continue
+            evidence = sorted(covered_actions, key=lambda row: (row.get("source_relative_path", ""), row["action_id"]))
+            candidates.append({
+                "subject_id": str(subject_id), "show_relative": show_relative,
+                "source_relative": relative, "source_parts": directory_parts,
+                "source_node": directory, "source_id": directory_id,
+                "manifest": manifest, "covered": evidence,
+                "videos": covered_videos, "target_directory": target_directory,
+                "dependency": next(iter(dependencies)),
+            })
+
+    # Parent candidates win. A valid parent already covers every descendant
+    # action, so emitting both would create overlapping moves.
+    candidates.sort(key=lambda row: (len(row["source_parts"]), row["source_relative"].casefold(), row["source_relative"]))
+    selected = []
+    selected_paths: List[Tuple[str, ...]] = []
+    for candidate in candidates:
+        if any(candidate["source_parts"][:len(path)] == path or path[:len(candidate["source_parts"])] == candidate["source_parts"]
+               for path in selected_paths):
+            continue
+        selected.append(candidate)
+        selected_paths.append(candidate["source_parts"])
+
+    used_by_target: Dict[str, set] = {}
+    for candidate in selected:
+        target_directory = candidate["target_directory"]
+        used = used_by_target.setdefault(target_directory, set())
+        if not used:
+            target_node = _node_by_relative_path(root, target_directory)
+            if target_node is not None and _is_dir(target_node):
+                used.update(str(child.get("name", "")).casefold()
+                            for child in target_node.get("children", []))
+            used.update(str(action.get("target_name", "")).casefold()
+                        for action in duplicate_actions
+                        if action.get("kind") == "organize_move"
+                        and action.get("target_dir_relative") == target_directory)
+        source_name = candidate["source_relative"].rsplit("/", 1)[-1]
+        target_name = source_name
+        if target_name.casefold() in used:
+            stable = hashlib.sha256((candidate["source_relative"] + "\0" + candidate["source_id"])
+                                    .encode("utf-8")).hexdigest()[:8]
+            target_name = source_name + " [dir-{}]".format(stable)
+            index = 2
+            while target_name.casefold() in used:
+                target_name = source_name + " [dir-{}-{}]".format(stable, index)
+                index += 1
+                if index > 1000:
+                    target_name = ""
+                    break
+        if not target_name:
+            continue
+        used.add(target_name.casefold())
+        target_relative = target_directory + "/" + target_name
+        source_parts = candidate["source_parts"]
+        parent_relative = "/".join(source_parts[:-1])
+        source_manifest = candidate["manifest"]
+        covered = candidate["covered"]
+        action_id = hashlib.sha256(("duplicate-directory\0{}\0{}\0{}\0{}".format(
+            candidate["subject_id"], candidate["source_relative"], candidate["source_id"], target_relative)
+            ).encode("utf-8")).hexdigest()[:24]
+        directory_action = {
+            "action_id": action_id, "kind": "organize_move",
+            "role": "duplicate_content_directory", "reason": "duplicate_content",
+            "organization_group": "verified-duplicate-directory",
+            "subject_id": candidate["subject_id"],
+            "show_name": next((row.get("show_name") for row in candidate["videos"] if row.get("show_name")), None),
+            "source_kind": "directory", "file_id": candidate["source_id"],
+            "original_name": source_name, "current_name": source_name,
+            "source_relative_path": candidate["source_relative"],
+            "source_dir_relative": parent_relative,
+            "source_path": _join_root(cfg["alist"]["root"], candidate["source_relative"]),
+            "source_dir": _join_root(cfg["alist"]["root"], parent_relative),
+            "target_relative_path": target_relative,
+            "target_path": _join_root(cfg["alist"]["root"], target_relative),
+            "target_dir_relative": candidate["target_directory"],
+            "target_dir": _join_root(cfg["alist"]["root"], candidate["target_directory"]),
+            "target_name": target_name,
+            "rename_before_move": target_name != source_name,
+            "requires_directory": candidate["dependency"],
+            "move_required": True,
+            "directory_manifest": source_manifest,
+            "covered_action_ids": sorted(row["action_id"] for row in covered),
+            "covered_duplicate_evidence": [{
+                "action_id": row["action_id"], "role": row.get("role"),
+                "source_relative_path": row.get("source_relative_path"),
+                "file_id": row.get("file_id"), "content_gcid": row.get("content_gcid"),
+                "content_size": row.get("content_size"),
+                "kept_relative_path": row.get("kept_relative_path"),
+                "episode_key": row.get("episode_key"),
+                "requires_verified_video": row.get("requires_verified_video"),
+            } for row in covered],
+            "state": "planned", "steps": [],
+        }
+        candidate["action"] = directory_action
+
+    folded_actions = [row["action"] for row in selected if row.get("action")]
+    folded_ids = {action_id for row in folded_actions for action_id in row["covered_action_ids"]}
+    remaining = [action for action in duplicate_actions if action.get("action_id") not in folded_ids]
+    folded_by_video = {}
+    for directory_action in folded_actions:
+        for evidence in directory_action["covered_duplicate_evidence"]:
+            if evidence.get("role") == "duplicate_content_video":
+                folded_by_video[evidence["source_relative_path"]] = directory_action
+    return remaining + folded_actions, folded_by_video
+
+
+def _path_is_within(value: Any, directory: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parts = _clean_relative_path(value, field="source path")
+        directory_parts = _clean_relative_path(directory, field="directory path")
+    except ReconcileError:
+        return False
+    return len(parts) > len(directory_parts) and parts[:len(directory_parts)] == directory_parts
+
+
 def _block_action(action: dict, code: str, message: str, *, fatal: bool = False) -> None:
     action["state"] = "blocked"
     action["blocked"] = {"code": code, "message": message, "fatal": bool(fatal)}
@@ -1113,6 +1496,8 @@ def _build_out_of_range_actions(inventory: dict, cfg: dict,
 def build_plan(inventory: dict, cfg: dict) -> dict:
     root = inventory["inventory_root"]
     organization_enabled = bool(cfg.get("organize_unassigned", False))
+    collapse_duplicate_directories = (organization_enabled
+                                      and bool(cfg.get("collapse_verified_duplicate_directories", False)))
     all_shows = _iter_shows(inventory)
     subjects: Dict[str, List[Tuple[str, dict]]] = {}
     unresolved: List[dict] = []
@@ -1357,6 +1742,11 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
         range_actions, range_issues, out_of_range = _build_out_of_range_actions(
             inventory, cfg, organization_actions)
         organization_issues.extend(range_issues)
+        folded_duplicate_by_video = {}
+        if collapse_duplicate_directories:
+            duplicate_content_actions, folded_duplicate_by_video = _collapse_verified_duplicate_directories(
+                inventory, cfg, duplicate_content_actions,
+                actions + organization_actions + range_actions, matched_roots)
         all_organization_actions = organization_actions + range_actions + duplicate_content_actions
         directory_actions = [row for row in all_organization_actions
                              if row.get("kind") == "organize_mkdir"]
@@ -1383,6 +1773,16 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
                                       "target_relative_path": row["target_relative_path"],
                                       "kept_relative_path": row.get("kept_relative_path"),
                                       "state": "planned"})
+        for source_relative, directory_action in folded_duplicate_by_video.items():
+            matched_video = next((item for item in unassigned
+                                  if item.get("relative_path") == source_relative), None)
+            if matched_video is not None:
+                matched_video.update({
+                    "reason": "duplicate_content",
+                    "target_relative_path": directory_action["target_relative_path"],
+                    "covered_by_action_id": directory_action["action_id"],
+                    "state": "planned",
+                })
     return {"actions": actions, "unresolved": unresolved, "unassigned": unassigned,
             "empty_directories": empty_directories, "matched_show_roots": matched_roots,
             "organization_enabled": organization_enabled, "out_of_range": out_of_range}
@@ -1738,6 +2138,23 @@ def _apply_organization_move(report: dict, report_path: Path, client: AListClien
         _write_journal(report_path, report)
         return False
 
+    def verify_directory_manifest() -> bool:
+        if "directory_manifest" not in action:
+            return True
+        matches, code, message = _verify_live_directory_manifest(client, action, current_name)
+        if matches:
+            return True
+        _block_action(action, code, message, fatal=True)
+        _add_error(report, action["action_id"], code, message)
+        _write_journal(report_path, report)
+        return False
+
+    # A collision-safe source rename is itself a write. Check the complete
+    # subtree before doing it, then check again immediately before the move.
+    if action.get("rename_before_move") and current_name != action["target_name"]:
+        if not verify_directory_manifest():
+            return True
+
     if action.get("rename_before_move") and current_name != action["target_name"]:
         if _children_named(source_rows, action["target_name"]):
             _block_action(action, "source_rename_conflict", "stable suffix already exists beside the source")
@@ -1803,6 +2220,9 @@ def _apply_organization_move(report: dict, report_path: Path, client: AListClien
         _block_action(action, "live_target_conflict", "destination name now exists; refusing overwrite")
         _write_journal(report_path, report)
         return False
+
+    if not verify_directory_manifest():
+        return True
 
     action["current_name"] = current_name
     action["state"] = "pending"

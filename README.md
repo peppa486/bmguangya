@@ -7,7 +7,7 @@
 1. 从 Bangumi 读取收藏状态和集数元数据，从已挂载光鸭的 AList 文件树读取当前目录。只有完整扫描才会替换最近一次成功库存；失败时保留旧库存并写入失败记录。可在 `inventory.cloud_source` 选择 `alist` 文件 API 或 `guangya_direct` 光鸭目录 API。
 2. 根据新鲜完整库存计算可确认的缺集，并按 Bangumi 收藏状态优先级从 Mikan RSS 匹配简体中文发布。默认跟踪全部收藏类型，默认下载顺序为“在看、想看、看过”；可通过配置缩小范围。DMHY 备用源尚未实现。
 3. 只对已确认缺集提交光鸭任务。单集选择和合集拆分必须能把种子内视频逐一准确映射到已知缺集；无法确认的候选会跳过。合集拆分配置为 `max_batch_episode_span`，没有 `allow_batch_torrent_splitting` 这个配置键。带外挂字幕的多文件种子目前不会提交，以免丢失字幕。
-4. 按 Bangumi 分类整理已匹配目录；根据完整库存和唯一集号证据归位、规范视频文件名并保留实际视频扩展名。只对与视频同目录且文件主名完全相同的字幕文件进行配对移动。未配对字幕、冲突、未知集号、重复映射和无法匹配的文件会保留并写入报告。不会删除光鸭文件或目录，也不会覆盖现有目标。
+4. 先按实际类型处理视频名包装目录：例如真实目录 `EP01.mkv` 会改为 `EP01.mkv [资源包]`，为真正的视频文件释放规范文件名；普通视频文件不受这一步影响。随后按 Bangumi 分类整理已匹配目录，根据完整库存和唯一集号证据归位、规范视频文件名并保留实际视频扩展名。只对与视频同目录且文件主名完全相同的字幕文件进行配对移动。未配对字幕、冲突、未知集号、重复映射和无法匹配的文件会保留并写入报告。不会删除光鸭文件或目录，也不会覆盖现有目标。
 5. 从唯一匹配的真实视频生成 `EPxx.strm`，并为唯一 Bangumi 匹配写入带 Bangumi ID 的 `tvshow.nfo`。默认排除 `未标记/待核对-*` 隔离目录及其所有后代；apply 时旧的本机 STRM/本程序 Bangumi NFO 会归档，避免重复包进入 Jellyfin。GUI 库存树仍展示这些真实云端内容。普通未匹配目录仍可以生成播放索引，但不会附加虚构的 Bangumi ID。未知集号不会被猜成普通集；Bangumi 已知 12 集而文件名是 `EP22` 时，不会把它伪装成该条目的普通第 22 集。OVA/SP 等可确认的特殊集单独保留。
 6. 向 Jellyfin 发送媒体库刷新请求。Jellyfin 需要由管理员安装、配置兼容当前 Jellyfin 版本的 Bangumi 元数据插件；HTTP 2xx 只表示刷新请求已接受，不代表插件已完成刮削。
 7. 在 VidHub 中手动添加 Jellyfin 服务器并使用 Jellyfin 账号登录。VidHub 是播放客户端，不由本程序配置；客户端能否播放还取决于 Jellyfin 与 AList WebDAV 地址对客户端可达。
@@ -62,6 +62,8 @@ sudoedit /etc/bmguangya/config.json
 | `jellyfin.base_url`, `jellyfin.token` | Jellyfin API 地址及专用 API token。建议创建权限最小的专用 token。若 token 留空，代码可以从 `jellyfin.db_path` 以只读方式读取 `jellyfin.username` 最近活动会话的 token。 |
 | `inventory.cloud_source` | `guangya_direct` 直接分页扫描光鸭目录，或 `alist` 通过 AList 文件 API 扫描。AList 挂载仍是凭据刷新和 STRM 播放所需依赖。 |
 | `reconcile.organize_unassigned` | 示例默认 `false`，先保守运行。用户已授权完整整理时可以设为 `true`，把可安全识别的未归类内容移动至“未标记/待核对”；不确定内容仍会留在原位。务必先看 dry-run 报告。 |
+| `reconcile.normalize_video_named_directories` | 默认 `true`。仅对唯一匹配番剧下、实际类型为目录且名称以视频扩展名结尾的直接子目录追加 `[资源包]`，可带 `(N)` 后缀；移动前核对完整子树，普通视频不改名。已确认的目录重命名会更新中间库存路径，保留原始扫描时间戳，不把路径维护伪装成新的全盘扫描。 |
+| `reconcile.collapse_verified_duplicate_directories` | 默认 `false`，且需要 `organize_unassigned=true`。当一个子目录中的全部视频均为已证明相同内容的重复件、保留件全在目录外时，可整包收纳，保留字幕及辅助文件。移动前递归核对完整目录清单；任何新增、缺失或变化都会阻止整包移动。 |
 
 样例的 `dry_run` 保持 `true`，用于保护直接调用。仓库流水线单元会显式以 `--apply` 运行下载、整理和 STRM 同步；只有完成下方检查并由部署者启用 timer 后，定时器才会执行这些写操作。
 
@@ -89,6 +91,9 @@ sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/library_inventory.py
   --config /etc/bmguangya/config.json --output /var/lib/bmguangya/library.json
 sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/bangumi_cloud_download.py \
   --config /etc/bmguangya/config.json --dry-run
+sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/normalize_cloud_wrappers.py \
+  --config /etc/bmguangya/config.json --inventory /var/lib/bmguangya/library.json \
+  --report /var/lib/bmguangya/wrapper-normalization-report.json --dry-run
 sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/reconcile_cloud_library.py \
   --config /etc/bmguangya/config.json --inventory /var/lib/bmguangya/library.json \
   --report /var/lib/bmguangya/reconcile-report.json --dry-run
@@ -106,7 +111,7 @@ sudo /opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/sync_library_strm.py
 仓库单元默认假设配置与目录位于上一节列出的安装路径。复制流水线需要的单元（不要启用旧式 `bangumi-mikan-sync.timer`）：
 
 ```bash
-sudo cp systemd/bmguangya-inventory.service systemd/bmguangya-download.service \
+sudo cp systemd/bmguangya-inventory.service systemd/bmguangya-download.service systemd/bmguangya-wrappers.service \
   systemd/bmguangya-reconcile.service systemd/bmguangya-strm-sync.service \
   systemd/bmguangya-pipeline.service systemd/bmguangya-pipeline.timer \
   systemd/bmguangya-monitor.service /etc/systemd/system/
@@ -117,6 +122,8 @@ sudo systemctl enable --now bmguangya-monitor.service
 ```
 
 流水线包含三次完整库存扫描：下载前、下载后和云端整理后；三次均成功后才同步 STRM。单次库存上限由 `inventory.max_runtime_seconds` 控制（样例为 45 分钟），inventory service 超时为 50 分钟；整个流水线最长 450 分钟。timer 每半小时触发一次，但若前一轮仍运行，全局锁与 systemd 会阻止并行执行，不能把触发间隔当作完成频率。systemd 单元以 root 运行，并限制写入状态目录和 Jellyfin 媒体目录；如果你使用不同路径，需要按最小权限原则调整单元的读写允许路径。
+
+手工运行写入阶段或替换阶段报告前，先停止 `bmguangya-pipeline.timer`，并等待正在执行的流水线和阶段单元结束；停止 timer 不会中断已经启动的任务。确认没有其他写入者后再执行手工命令，完成后恢复 timer。全局锁保护 systemd 流水线，不能替代管理员对独立 CLI 命令的串行管理。
 
 ```bash
 systemctl list-timers --all bmguangya-pipeline.timer --no-pager

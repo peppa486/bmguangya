@@ -141,6 +141,47 @@ def add_verified_duplicate_episode(inventory, *, second_gcid=None, second_size=1
     return inventory
 
 
+def make_verified_duplicate_pack_inventory(*, second_episode=False):
+    inventory = add_verified_duplicate_episode(make_inventory(extra=False))
+    show = inventory["tree"][0]["shows"][0]
+    show_node = inventory["inventory_root"]["children"][0]["children"][0]
+    pack = next(child for child in show_node["children"] if child["name"] == "Disc 01")
+    pack["file_id"] = "disc-pack-id"
+    next(child for child in pack["children"] if child["name"] == "01.ass")["size"] = 42
+    if second_episode:
+        pack_video = fnode("02.mkv", "video-2-copy")
+        pack_video.update({"size": 200, "gcid": "b" * 40})
+        pack_subtitle = fnode("02.ass", "subtitle-2-copy")
+        pack_subtitle["size"] = 43
+        root_video = fnode("EP02.mkv", "video-2-keeper")
+        root_video.update({"size": 200, "gcid": "b" * 40})
+        pack["children"].extend([pack_video, pack_subtitle])
+        show_node["children"].append(root_video)
+        show["duplicate_eps"].append("EP02")
+        show["episodes"].append({
+            "episode_key": "EP02", "episode_id": 102, "sort": 2,
+            "present": True, "missing": False,
+            "file_id": "video-2-copy", "relative_path": SHOW_REL + "/Disc 01/02.mkv",
+            "file_name": "02.mkv",
+            "present_files": [
+                {"relative_path": SHOW_REL + "/Disc 01/02.mkv", "name": "02.mkv",
+                 "file_id": "video-2-copy", "size": 200, "gcid": "b" * 40},
+                {"relative_path": SHOW_REL + "/EP02.mkv", "name": "EP02.mkv",
+                 "file_id": "video-2-keeper", "size": 200, "gcid": "b" * 40},
+            ],
+        })
+    return inventory
+
+
+def add_duplicate_review_name_collision(inventory):
+    title_directory = dnode("准确标题", [fnode("Disc 01", "existing-review-item")],
+                            file_id="review-title-dir")
+    duplicate_review = dnode("待核对-重复内容", [title_directory], file_id="duplicate-review-dir")
+    unmarked = dnode("未标记", [duplicate_review], file_id="unmarked-review-dir")
+    inventory["inventory_root"]["children"].append(unmarked)
+    return inventory
+
+
 def config(tmp, *, nested=True):
     return rec.normalize_config({
         "alist": {"api_base": "http://alist.test:5244", "root": ROOT, "token": "secret"},
@@ -327,6 +368,80 @@ class ReconcilePlanTests(unittest.TestCase):
         self.assertFalse(any(row.get("code") in {"not_single_file", "duplicate_episode", "unpaired_subtitle"}
                              and row.get("episode_key") == "EP01" for row in plan["unresolved"]))
 
+    def test_verified_directory_collapse_is_opt_in_and_keeps_full_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_verified_duplicate_pack_inventory(second_episode=True)
+            cfg = config(tmp)
+            self.assertFalse(cfg["collapse_verified_duplicate_directories"])
+            cfg["collapse_verified_duplicate_directories"] = True
+            disabled = rec.build_plan(inventory, cfg)
+            self.assertFalse(any(row.get("role") == "duplicate_content_directory"
+                                 for row in disabled["actions"]))
+
+            cfg["organize_unassigned"] = True
+            cfg["collapse_verified_duplicate_directories"] = False
+            per_file = rec.build_plan(inventory, cfg)
+            self.assertFalse(any(row.get("role") == "duplicate_content_directory"
+                                 for row in per_file["actions"]))
+            cfg["collapse_verified_duplicate_directories"] = True
+            collapsed = rec.build_plan(inventory, cfg)
+
+        directory_actions = [row for row in collapsed["actions"]
+                             if row.get("role") == "duplicate_content_directory"]
+        self.assertEqual(len(directory_actions), 1)
+        action = directory_actions[0]
+        self.assertEqual(action["source_kind"], "directory")
+        self.assertEqual(action["source_relative_path"], SHOW_REL + "/Disc 01")
+        self.assertEqual(action["target_relative_path"], "未标记/待核对-重复内容/准确标题/Disc 01")
+        self.assertEqual(len(action["covered_action_ids"]), 4)
+        self.assertEqual(len(action["covered_duplicate_evidence"]), 4)
+        self.assertEqual({row["relative_path"] for row in action["directory_manifest"]},
+                         {"01.mkv", "01.ass", "02.mkv", "02.ass"})
+        self.assertEqual({row["file_id"] for row in action["directory_manifest"]},
+                         {"video-1", "subtitle-1", "video-2-copy", "subtitle-2-copy"})
+        self.assertFalse(any(row.get("role") in {"duplicate_content_video", "duplicate_content_subtitle"}
+                             for row in collapsed["actions"]))
+        duplicate_rows = [row for row in collapsed["unassigned"]
+                          if row.get("relative_path") in {SHOW_REL + "/Disc 01/01.mkv",
+                                                          SHOW_REL + "/Disc 01/02.mkv"}]
+        self.assertTrue(all(row["state"] == "planned" for row in duplicate_rows))
+        self.assertTrue(all(row["covered_by_action_id"] == action["action_id"] for row in duplicate_rows))
+
+    def test_keeper_unique_video_or_missing_identity_prevents_directory_collapse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keeper_inside = make_verified_duplicate_pack_inventory()
+            show_node = keeper_inside["inventory_root"]["children"][0]["children"][0]
+            pack = next(child for child in show_node["children"] if child["name"] == "Disc 01")
+            keeper = next(child for child in show_node["children"] if child["name"] == "EP01.mkv")
+            show_node["children"].remove(keeper)
+            pack["children"].append(keeper)
+            keeper_evidence = keeper_inside["tree"][0]["shows"][0]["episodes"][0]["present_files"][1]
+            keeper_evidence["relative_path"] = SHOW_REL + "/Disc 01/EP01.mkv"
+            keeper_inside["tree"][0]["shows"][0]["episodes"][0]["file_name"] = "01.mkv"
+
+            unique_video = make_verified_duplicate_pack_inventory()
+            unique_pack = next(child for child in unique_video["inventory_root"]["children"][0]["children"][0]["children"]
+                               if child["name"] == "Disc 01")
+            unique_pack["children"].append(fnode("bonus.mp4", "unique-video"))
+
+            unknown_hash = add_verified_duplicate_episode(make_inventory(extra=False), second_gcid="b" * 40)
+            unknown_pack = next(child for child in unknown_hash["inventory_root"]["children"][0]["children"][0]["children"]
+                                if child["name"] == "Disc 01")
+            unknown_pack["file_id"] = "unknown-hash-pack"
+
+            unknown_aux_id = make_verified_duplicate_pack_inventory()
+            aux_pack = next(child for child in unknown_aux_id["inventory_root"]["children"][0]["children"][0]["children"]
+                            if child["name"] == "Disc 01")
+            aux_pack["children"].append(fnode("cover.jpg", None))
+
+            for inventory in (keeper_inside, unique_video, unknown_hash, unknown_aux_id):
+                cfg = config(tmp)
+                cfg["organize_unassigned"] = True
+                cfg["collapse_verified_duplicate_directories"] = True
+                plan = rec.build_plan(inventory, cfg)
+                self.assertFalse(any(row.get("role") == "duplicate_content_directory"
+                                     for row in plan["actions"]))
+
     def test_different_or_missing_content_evidence_keeps_every_duplicate_in_place(self):
         cases = (
             {"second_gcid": "b" * 40},
@@ -497,14 +612,16 @@ class ReconcilePlanTests(unittest.TestCase):
 
 
 class ReconcileExecutionTests(unittest.TestCase):
-    def _run(self, tmp, inventory, client=None, *, apply=False, report=None, organize_unassigned=False):
+    def _run(self, tmp, inventory, client=None, *, apply=False, report=None,
+             organize_unassigned=False, collapse_duplicate_directories=False):
         cfg_path = Path(tmp) / "runtime.json"
         inv_path = Path(tmp) / "library.json"
         report_path = report or Path(tmp) / "reconcile.json"
         cfg_path.write_text(json.dumps({
             "alist": {"api_base": "http://alist.test:5244", "root": ROOT, "token": "secret"},
             "inventory": {"output": str(inv_path), "freshness_ttl_seconds": 3600},
-            "reconcile": {"report": str(report_path), "organize_unassigned": organize_unassigned},
+            "reconcile": {"report": str(report_path), "organize_unassigned": organize_unassigned,
+                          "collapse_verified_duplicate_directories": collapse_duplicate_directories},
         }), encoding="utf-8")
         inv_path.write_text(json.dumps(inventory, ensure_ascii=False), encoding="utf-8")
         return rec.run_reconcile(cfg_path, inv_path, report_path, apply=apply, client=client, now=NOW)
@@ -665,6 +782,101 @@ class ReconcileExecutionTests(unittest.TestCase):
             self.assertEqual(client.dirs["/guangya/Anime/未标记/待核对-根目录散落"][0]["name"],
                              "root-stray.mkv")
             self.assertFalse(any(write[0] == "delete" for write in client.writes))
+
+    def test_collapsed_duplicate_directory_uses_stable_collision_name_and_preserves_existing_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_duplicate_review_name_collision(
+                make_verified_duplicate_pack_inventory(second_episode=True))
+            client = MemoryAList(inventory["inventory_root"])
+            report, code = self._run(tmp, inventory, client, apply=True,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 0)
+        action = next(row for row in report["actions"]
+                      if row.get("role") == "duplicate_content_directory")
+        self.assertTrue(action["target_name"].startswith("Disc 01 [dir-"))
+        self.assertEqual(action["state"], "done")
+        target = abs_path(action["target_relative_path"].rsplit("/", 1)[0])
+        self.assertEqual({row["name"] for row in client.dirs[target]}, {"Disc 01", action["target_name"]})
+        self.assertEqual(next(row for row in client.dirs[target] if row["name"] == "Disc 01")["file_id"],
+                         "existing-review-item")
+        self.assertIn(abs_path(action["target_relative_path"]), client.dirs)
+        self.assertFalse(any(row[0] == "delete" for row in client.writes))
+
+    def test_live_added_subtree_entry_blocks_collapsed_directory_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_verified_duplicate_pack_inventory(second_episode=True)
+            client = MemoryAList(inventory["inventory_root"])
+            source_subtree = abs_path(SHOW_REL + "/Disc 01")
+            client.dirs[source_subtree].append(fnode("new-unique.mp4", "live-added-video"))
+            report, code = self._run(tmp, inventory, client, apply=True,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 2)
+        action = next(row for row in report["actions"]
+                      if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(action["state"], "blocked")
+        self.assertEqual(action["blocked"]["code"], "directory_manifest_changed")
+        self.assertIn("live subtree entry count", action["blocked"]["message"])
+        self.assertFalse(any(write[0] == "move" and write[1] == abs_path(SHOW_REL)
+                             and write[3] == "Disc 01" for write in client.writes))
+        self.assertIn("new-unique.mp4", {row["name"] for row in client.dirs[source_subtree]})
+
+    def test_live_gcid_change_blocks_collapsed_directory_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_verified_duplicate_pack_inventory()
+            client = MemoryAList(inventory["inventory_root"])
+            source_subtree = abs_path(SHOW_REL + "/Disc 01")
+            next(row for row in client.dirs[source_subtree] if row["name"] == "01.mkv")["gcid"] = "c" * 40
+            report, code = self._run(tmp, inventory, client, apply=True,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 2)
+        action = next(row for row in report["actions"]
+                      if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(action["state"], "blocked")
+        self.assertEqual(action["blocked"]["code"], "directory_manifest_changed")
+        self.assertIn("GCID changed", action["blocked"]["message"])
+        self.assertFalse(any(write[0] == "move" and write[1] == abs_path(SHOW_REL)
+                             and write[3] == "Disc 01" for write in client.writes))
+
+    def test_pending_collapsed_move_recovers_from_target_id_without_source_manifest(self):
+        class SourceSubtreeUnavailable(MemoryAList):
+            unavailable_paths = set()
+
+            def list_all(self, path, *, refresh=True):
+                if path in self.unavailable_paths:
+                    raise rec.ReconcileError("source subtree is no longer readable", code="missing_dir")
+                return super().list_all(path, refresh=refresh)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_verified_duplicate_pack_inventory(second_episode=True)
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            cfg["collapse_verified_duplicate_directories"] = True
+            action = next(row for row in rec.build_plan(inventory, cfg)["actions"]
+                          if row.get("role") == "duplicate_content_directory")
+            client = SourceSubtreeUnavailable(inventory["inventory_root"])
+            client.make_dir(abs_path("未标记"))
+            client.make_dir(abs_path("未标记/待核对-重复内容"))
+            client.make_dir(abs_path("未标记/待核对-重复内容/准确标题"))
+            client.move_file(action["source_dir"], action["target_dir"], action["original_name"])
+            client.unavailable_paths.add(action["source_path"])
+            writes_before_recovery = list(client.writes)
+            report_path = Path(tmp) / "reconcile.json"
+            pending = dict(action, state="pending", pending_step="organize_move",
+                           current_name=action["original_name"], pending_since=NOW.isoformat(), steps=[])
+            report_path.write_text(json.dumps({"actions": [pending]}), encoding="utf-8")
+
+            report, code = self._run(tmp, inventory, client, apply=True, report=report_path,
+                                     organize_unassigned=True, collapse_duplicate_directories=True)
+
+        self.assertEqual(code, 0)
+        recovered = next(row for row in report["actions"]
+                         if row.get("role") == "duplicate_content_directory")
+        self.assertEqual(recovered["state"], "done")
+        self.assertTrue(recovered["recovered_from_pending"])
+        self.assertEqual(client.writes, writes_before_recovery)
 
     def test_numbered_duplicate_packs_apply_as_preserved_nested_directories(self):
         with tempfile.TemporaryDirectory() as tmp:

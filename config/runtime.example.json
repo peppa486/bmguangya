@@ -63,7 +63,7 @@
     "progress_path": "/var/lib/bmguangya/library.progress.json",
     "progress_interval_seconds": 15,
     "freshness_ttl_seconds": 900,
-    "max_workers": 3,
+    "max_workers": 4,
     "max_runtime_seconds": 2700,
     "cloud_source": "guangya_direct"
   },
@@ -82,7 +82,9 @@
   "pipeline_lock_path": "/var/lib/bmguangya/pipeline.lock",
   "reconcile": {
     "report": "/var/lib/bmguangya/reconcile-report.json",
-    "organize_unassigned": false
+    "organize_unassigned": false,
+    "normalize_video_named_directories": true,
+    "collapse_verified_duplicate_directories": false
   },
   "network_timeout_seconds": 30,
   "jellyfin": {

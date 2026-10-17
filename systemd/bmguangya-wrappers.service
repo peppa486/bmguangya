@@ -1,0 +1,28 @@
+[Unit]
+Description=Normalize video-named cloud directories and maintain verified inventory paths
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/bmguangya/config.json
+ConditionPathExists=/var/lib/bmguangya/library.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+StateDirectory=bmguangya
+StateDirectoryMode=0750
+WorkingDirectory=/opt/bmguangya
+ExecStart=/opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/normalize_cloud_wrappers.py --config /etc/bmguangya/config.json --inventory /var/lib/bmguangya/library.json --report /var/lib/bmguangya/wrapper-normalization-report.json --apply
+TimeoutStartSec=45min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/bmguangya
+ReadOnlyPaths=/etc/bmguangya/config.json
