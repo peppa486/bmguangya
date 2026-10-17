@@ -395,7 +395,8 @@ class BangumiCloudDownloadMikanOverrideTests(unittest.TestCase):
 
 class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
     def _fixture(self, *, dry_run, episode_count=12, missing_numbers=None,
-                 rss_items=None, single_video=False, subtitle_sidecar=False):
+                 rss_items=None, single_video=False, subtitle_sidecar=False,
+                 remote_target_items=None):
         class FakeBangumiClient:
             def __init__(self, cfg):
                 self.cfg = cfg
@@ -424,17 +425,22 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
                 }]
 
         class FakeGuangYaClient:
-            def __init__(self, single_video=False, subtitle_sidecar=False):
+            def __init__(self, single_video=False, subtitle_sidecar=False,
+                         target_items=None):
                 self.created = []
                 self.submitted = []
                 self.single_video = single_video
                 self.subtitle_sidecar = subtitle_sidecar
+                self.target_items = list(target_items or [])
+                self.file_list_calls = []
 
             def list_all_tasks(self):
                 return []
 
             def get_file_list(self, parent_id, page_size, page):
-                return {'data': {'list': [], 'total': 0}}
+                self.file_list_calls.append((parent_id, page_size, page))
+                items = self.target_items if parent_id == 'dir-3' else []
+                return {'data': {'list': list(items), 'total': len(items)}}
 
             def create_dir(self, parent_id, name, fail_if_exist=False):
                 folder_id = f'dir-{len(self.created) + 1}'
@@ -496,6 +502,7 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
         write_inventory(inventory_path, episodes=episodes, matched=True, unmatched=False)
         client = None if dry_run else FakeGuangYaClient(
             single_video=single_video, subtitle_sidecar=subtitle_sidecar,
+            target_items=remote_target_items,
         )
         cfg = {
             'state_path': state_path, 'inventory_path': inventory_path,
@@ -664,6 +671,72 @@ class BangumiCloudDownloadBatchIntegrationTests(unittest.TestCase):
             self.assertEqual(task['file_indexes'], list(range(5, 12)))
             self.assertTrue(task['batch'])
             self.assertEqual(task['task_id'], 'batch-task-1')
+        finally:
+            self._restore(fixture)
+
+    def test_fresh_target_mp4_blocks_single_mkv_after_inventory_snapshot(self):
+        item = {
+            'guid': 'single-ep01',
+            'title': '[Group] 测试番 [01] [简中] [1080p]',
+            'torrent_url': 'https://example.com/test-show-01.torrent',
+        }
+        fixture = self._fixture(
+            dry_run=False, episode_count=1, missing_numbers={1},
+            rss_items=[item], single_video=True,
+            remote_target_items=[{
+                'fileId': 'new-file-after-scan', 'fileName': 'EP01.mp4', 'resType': 1,
+            }],
+        )
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 0)
+            self.assertEqual(fixture[1].submitted, [])
+            self.assertEqual(result['skipped'][0]['reason'], 'target_episode_already_present')
+            self.assertEqual(result['skipped'][0]['existing_episode_keys'], ['EP01'])
+            self.assertEqual(result['skipped'][0]['existing_target_files'], {'EP01': ['EP01.mp4']})
+            self.assertIn(('dir-3', 100, 0), fixture[1].file_list_calls)
+        finally:
+            self._restore(fixture)
+
+    def test_directory_named_like_episode_video_does_not_block_single_submission(self):
+        item = {
+            'guid': 'single-ep01',
+            'title': '[Group] 测试番 [01] [简中] [1080p]',
+            'torrent_url': 'https://example.com/test-show-01.torrent',
+        }
+        fixture = self._fixture(
+            dry_run=False, episode_count=1, missing_numbers={1},
+            rss_items=[item], single_video=True,
+            remote_target_items=[{
+                'fileId': 'directory-named-like-video', 'fileName': 'EP01.mkv', 'resType': 2,
+            }],
+        )
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 1)
+            self.assertEqual(len(fixture[1].submitted), 1)
+            self.assertEqual(fixture[1].submitted[0]['newName'], 'EP01.mkv')
+        finally:
+            self._restore(fixture)
+
+    def test_fresh_target_episode_inside_batch_skips_the_entire_batch(self):
+        fixture = self._fixture(
+            dry_run=False, episode_count=12, missing_numbers=set(range(6, 13)),
+            remote_target_items=[{
+                'fileId': 'new-ep08-after-scan', 'fileName': 'EP08.mp4', 'resType': 1,
+            }],
+        )
+        try:
+            result = mod.process_collections(fixture[0], fixture[1], dry_run=False)
+
+            self.assertEqual(result['submitted_count'], 0)
+            self.assertEqual(fixture[1].submitted, [])
+            self.assertEqual(result['skipped'][0]['reason'], 'target_episode_already_present')
+            self.assertEqual(result['skipped'][0]['existing_episode_keys'], ['EP08'])
+            self.assertEqual(result['skipped'][0]['existing_target_files'], {'EP08': ['EP08.mp4']})
+            self.assertIn(('dir-3', 100, 0), fixture[1].file_list_calls)
         finally:
             self._restore(fixture)
 

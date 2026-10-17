@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import reconcile_cloud_library as rec
 
@@ -573,6 +574,78 @@ class ReconcileExecutionTests(unittest.TestCase):
             self.assertEqual(report["actions"][0]["state"], "pending")
             self.assertEqual(report["actions"][0]["pending_step"], "move")
             self.assertEqual(client.writes, [])
+
+    def test_pending_evidence_survives_interrupt_after_first_replan_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(with_subtitle=False, extra=False)
+            cfg = config(tmp)
+            action = rec.build_plan(inventory, cfg)["actions"][0]
+            report_path = Path(tmp) / "reconcile.json"
+            steps = [{"step": "move", "state": "request_started", "at": "2026-10-17T00:00:00Z"}]
+            prior_action = dict(action, state="pending", pending_step="move",
+                                pending_since="2026-10-17T00:00:00Z",
+                                pending_error={"code": "response_lost", "message": "unconfirmed"},
+                                steps=steps)
+            report_path.write_text(json.dumps({"actions": [prior_action]}), encoding="utf-8")
+
+            original_write = rec._write_journal
+            writes = 0
+
+            def write_then_interrupt(path, report):
+                nonlocal writes
+                original_write(path, report)
+                writes += 1
+                if writes == 1:
+                    raise KeyboardInterrupt("simulated process stop after initial plan journal")
+
+            with mock.patch.object(rec, "_write_journal", side_effect=write_then_interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self._run(tmp, inventory, FakeAList(), apply=True, report=report_path)
+
+            interrupted = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(interrupted["actions"][0]["state"], "pending")
+            self.assertEqual(interrupted["actions"][0]["pending_step"], "move")
+            self.assertEqual(interrupted["actions"][0]["steps"], steps)
+            self.assertEqual(interrupted["actions"][0]["pending_error"]["code"], "response_lost")
+
+            client = FakeAList(fail_list=True)
+            report, code = self._run(tmp, inventory, client, apply=True, report=report_path)
+            self.assertEqual(code, 2)
+            self.assertEqual(report["actions"][0]["state"], "pending")
+            self.assertEqual(report["actions"][0]["pending_step"], "move")
+            self.assertEqual(report["actions"][0]["steps"], steps)
+            self.assertEqual(client.writes, [])
+
+    def test_unmatched_pending_is_retained_and_blocks_new_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_inventory = make_inventory(with_subtitle=False, extra=False)
+            cfg = config(tmp)
+            old_action = rec.build_plan(original_inventory, cfg)["actions"][0]
+            report_path = Path(tmp) / "reconcile.json"
+            steps = [{"step": "move", "state": "request_started", "at": "2026-10-17T00:00:00Z"}]
+            prior_action = dict(old_action, state="pending", pending_step="move", steps=steps)
+            report_path.write_text(json.dumps({"actions": [prior_action]}), encoding="utf-8")
+
+            inventory = copy.deepcopy(original_inventory)
+            inventory["tree"][0]["shows"][0]["episodes"][0]["file_id"] = "replacement-video"
+            inventory["tree"][0]["shows"][0]["episodes"][0]["present_files"][0]["file_id"] = "replacement-video"
+            disc = inventory["inventory_root"]["children"][0]["children"][0]["children"][0]
+            disc["children"][0]["file_id"] = "replacement-video"
+            client = FakeAList()
+
+            report, code = self._run(tmp, inventory, client, apply=True, report=report_path)
+
+            self.assertEqual(code, 2)
+            self.assertEqual(client.writes, [])
+            carried = next(row for row in report["actions"] if row["action_id"] == old_action["action_id"])
+            self.assertEqual(carried["state"], "pending")
+            self.assertEqual(carried["pending_step"], "move")
+            self.assertEqual(carried["steps"], steps)
+            self.assertEqual(carried["pending_recovery_status"], "action_not_in_new_plan")
+            replacement = next(row for row in report["actions"] if row["file_id"] == "replacement-video")
+            self.assertEqual(replacement["state"], "blocked")
+            self.assertEqual(replacement["blocked"]["code"], "unmatched_pending_journal")
+            self.assertIn("pending_action_not_in_new_plan", {row["code"] for row in report["errors"]})
 
     def test_organization_apply_journals_and_verifies_moves_without_deleting(self):
         with tempfile.TemporaryDirectory() as tmp:

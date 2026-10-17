@@ -3,7 +3,7 @@
 The default mode is a local dry-run plan. ``--apply`` enables per-file AList
 move/rename requests, each journaled before the request and verified through
 fresh source/destination listings afterwards. This tool never deletes files or
-directories and never changes show/category directories.
+directories. Opt-in organization moves unclaimed resources into review folders.
 """
 from __future__ import annotations
 
@@ -1858,21 +1858,24 @@ def apply_actions(report: dict, report_path: Path, client: AListClient,
             completed_actions[action["action_id"]] = action.get("state")
             continue
         action_id = action["action_id"]
+        previous = previous_actions.get(action_id)
+        was_pending = bool(previous and previous.get("state") == "pending")
         required_directory = action.get("requires_directory")
-        if required_directory and completed_actions.get(required_directory) != "done":
+        if (required_directory and completed_actions.get(required_directory) != "done"
+                and not was_pending):
             _block_action(action, "target_directory_unavailable",
                           "required review directory was not verified as created")
             completed_actions[action_id] = "blocked"
             _write_journal(report_path, report)
             continue
         dependency = action.get("requires_verified_video")
-        if dependency and completed_actions.get(dependency) not in ("done", "noop"):
+        if (dependency and completed_actions.get(dependency) not in ("done", "noop")
+                and not was_pending):
             _block_action(action, "video_not_verified",
                           "subtitle move requires its video action to be verified first")
             completed_actions[action_id] = "blocked"
             _write_journal(report_path, report)
             continue
-        previous = previous_actions.get(action_id)
         if action.get("kind") == "organize_mkdir":
             uncertain = _apply_organization_mkdir(report, report_path, client, action, previous) or uncertain
             completed_actions[action_id] = action.get("state")
@@ -2158,6 +2161,41 @@ def _previous_actions(report_path: Path) -> dict:
             if isinstance(item, dict) and item.get("action_id")}
 
 
+def _merge_pending_actions(plan: dict, previous_actions: dict) -> List[dict]:
+    """Carry unresolved write evidence into the journal before it is replaced.
+
+    A pending action matching the new plan keeps its recovery state and history.
+    If the new plan no longer contains that action, retain the old action as an
+    explicit orphan so callers can block all new writes instead of erasing the
+    only evidence that a cloud request may have succeeded.
+    """
+    planned = {str(action.get("action_id")): action for action in plan.get("actions", [])
+               if isinstance(action, dict) and action.get("action_id")}
+    unmatched = []
+    recovery_fields = ("pending_since", "pending_error", "current_name", "steps")
+    for action_id, previous in previous_actions.items():
+        if not isinstance(previous, dict) or previous.get("state") != "pending":
+            continue
+        current = planned.get(str(action_id))
+        if current is not None:
+            current["state"] = "pending"
+            current["pending_step"] = previous.get("pending_step") or "unknown"
+            for field in recovery_fields:
+                if field in previous:
+                    value = previous[field]
+                    current[field] = list(value) if field == "steps" and isinstance(value, list) else value
+            continue
+
+        carried = dict(previous)
+        carried["state"] = "pending"
+        carried["pending_step"] = previous.get("pending_step") or "unknown"
+        carried["steps"] = list(previous.get("steps") or [])
+        carried["pending_recovery_status"] = "action_not_in_new_plan"
+        plan.setdefault("actions", []).append(carried)
+        unmatched.append(carried)
+    return unmatched
+
+
 def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
                   report_path: Optional[Path] = None, *, apply: bool = False,
                   client: Optional[AListClient] = None,
@@ -2180,6 +2218,18 @@ def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
             raise ReconcileError("existing report has pending cloud writes; preserving journal and refusing dry-run overwrite",
                                  code="journal_pending")
         plan = build_plan(inventory, cfg)
+        unmatched_pending = _merge_pending_actions(plan, previous_actions) if apply else []
+        if unmatched_pending:
+            prior_pending_ids = {str(action_id) for action_id, item in previous_actions.items()
+                                 if isinstance(item, dict) and item.get("state") == "pending"}
+            for action in plan["actions"]:
+                if str(action.get("action_id")) in prior_pending_ids:
+                    continue
+                if action.get("state") not in ("blocked", "noop"):
+                    _block_action(
+                        action, "unmatched_pending_journal",
+                        "an unresolved prior cloud write is absent from the new plan; new writes are disabled",
+                    )
     except (OSError, ValueError, json.JSONDecodeError, ReconcileError) as exc:
         issue = {"code": exc.code if isinstance(exc, ReconcileError) else "input_error", "message": str(exc)}
         fatal = {"schema_version": SCHEMA_VERSION, "mode": "apply" if apply else "dry-run",
@@ -2192,13 +2242,14 @@ def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
         atomic_write_json(failure_path, fatal)
         return fatal, 1
 
+    pending_count = sum(1 for action in plan["actions"] if action.get("state") == "pending")
     report = {
         "schema_version": SCHEMA_VERSION,
         "mode": "apply" if apply else "dry-run",
         "started_at": iso_now(),
         "updated_at": iso_now(),
         "report_path": str(report_file),
-        "complete": True,
+        "complete": pending_count == 0 and not unmatched_pending,
         "applied": False,
         "inventory_path": str(inventory_file),
         "inventory_generated_at": freshness["generated_at"],
@@ -2211,7 +2262,13 @@ def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
         "organization_enabled": plan["organization_enabled"],
         "empty_directories": plan["empty_directories"],
         "emptied_source_directories": [],
-        "errors": [],
+        "pending_action_count": pending_count,
+        "unmatched_pending_action_ids": [action.get("action_id") for action in unmatched_pending],
+        "errors": [{
+            "action_id": action.get("action_id"), "code": "pending_action_not_in_new_plan",
+            "message": "unresolved prior cloud write is absent from the new plan; new writes are disabled",
+            "pending_step": action.get("pending_step"),
+        } for action in unmatched_pending],
     }
     if not apply:
         _sync_out_of_range_states(report)
@@ -2221,6 +2278,13 @@ def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
         _write_journal(report_file, report)
         return report, 0
 
+    if unmatched_pending:
+        report["blocked"] = True
+        report["blocked_count"] = sum(1 for item in report["actions"] if item.get("state") == "blocked") + len(report["unresolved"])
+        report["action_counts"] = _action_counts(report["actions"])
+        _write_journal(report_file, report)
+        return report, 2
+
     report["applied"] = True
     _write_journal(report_file, report)
     active_client = client or AListClient(cfg)
@@ -2229,6 +2293,7 @@ def run_reconcile(config_path: Path, inventory_path: Optional[Path] = None,
     report["blocked_count"] = sum(1 for item in report["actions"] if item.get("state") == "blocked") + len(report["unresolved"])
     report["blocked"] = report["blocked_count"] > 0
     report["action_counts"] = _action_counts(report["actions"])
+    report["pending_action_count"] = sum(1 for item in report["actions"] if item.get("state") == "pending")
     report["complete"] = not uncertain and not bool(report["errors"])
     _write_journal(report_file, report)
     return report, 2 if uncertain or report["errors"] else 0

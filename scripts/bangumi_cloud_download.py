@@ -550,6 +550,79 @@ def get_remote_folder_name_index(
     return names
 
 
+def _episode_keys_from_remote_video_name(file_name: str) -> set:
+    """Extract only episode labels that can be tied to a video filename.
+
+    GuangYa may store a batch under a generated name such as
+    ``Show BATCH-EP06-EP12.mkv``. Preserve that range so a later single-episode
+    task cannot duplicate one of the batch's episodes.
+    """
+    stem = Path(file_name).stem
+    range_match = re.search(
+        r"(?<![A-Z0-9])EP\s*0*(\d{1,3})\s*[-~—–]\s*EP?\s*0*(\d{1,3})(?!\d)",
+        stem, flags=re.I,
+    )
+    if range_match:
+        start, end = (int(value) for value in range_match.groups())
+        if 0 <= start <= end < 200:
+            return {f"EP{number:02d}" for number in range(start, end + 1)}
+
+    bracket_range = re.search(
+        r"(?<!\d)[\[【(（]\s*(?:EP\s*)?0*(\d{1,3})\s*[-~—–]\s*"
+        r"(?:EP\s*)?0*(\d{1,3})\s*[\]】)）]",
+        stem, flags=re.I,
+    )
+    if bracket_range:
+        start, end = (int(value) for value in bracket_range.groups())
+        if 0 <= start <= end < 200:
+            return {f"EP{number:02d}" for number in range(start, end + 1)}
+
+    key = canonical_episode_key(extract_episode_label(file_name, file_name))
+    if key:
+        return {key}
+    bare_number = re.fullmatch(r"\s*(\d{1,3})(?:v\d+)?\s*", stem, flags=re.I)
+    if bare_number and int(bare_number.group(1)) < 200:
+        return {canonical_episode_key(bare_number.group(1))}
+    return set()
+
+
+def get_remote_episode_file_index(
+    client: GuangYaClient,
+    folder_id: str,
+    episode_keys: List[str],
+) -> Dict[str, List[str]]:
+    """Freshly list a destination folder and map matching episode videos to names.
+
+    This intentionally bypasses ``children_cache``: the inventory may predate a
+    manually or externally added file. Only explicit file rows with a supported
+    video extension count; a directory named ``EP01.mkv`` is not a video.
+    """
+    expected = {canonical_episode_key(key) for key in episode_keys if key}
+    if not expected:
+        return {}
+    existing: Dict[str, List[str]] = {}
+    for row in list_all_children(client, folder_id):
+        raw_type = row.get("resType")
+        if isinstance(raw_type, bool):
+            raise RuntimeError("GuangYa target directory response has invalid resType")
+        try:
+            res_type = int(raw_type)
+        except (TypeError, ValueError):
+            raise RuntimeError("GuangYa target directory response has invalid resType") from None
+        if res_type == 2:
+            continue
+        if res_type != 1:
+            raise RuntimeError("GuangYa target directory response has invalid resType")
+        file_name = row.get("fileName")
+        if not isinstance(file_name, str) or not file_name:
+            raise RuntimeError("GuangYa target directory response has invalid fileName")
+        if Path(file_name).suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        for key in _episode_keys_from_remote_video_name(file_name) & expected:
+            existing.setdefault(key, []).append(file_name)
+    return existing
+
+
 def apply_subject_sync_actions(client: Optional[GuangYaClient], root_dir_id: str, actions: List[dict], state: dict, dry_run: bool,
                                children_cache: Optional[Dict[str, List[dict]]] = None) -> List[dict]:
     applied: List[dict] = []
@@ -1692,6 +1765,16 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
                 file_name = f"{episode_key}{suffix}"
             category_id = ensure_child_dir(client, root_id, category_dir, children_cache)
             folder_id = ensure_child_dir(client, category_id, show_dir, children_cache)
+            existing_episode_files = get_remote_episode_file_index(client, folder_id, episode_keys)
+            if existing_episode_files:
+                skipped.append({
+                    "subject_id": subject_id,
+                    "episode_key": episode_key,
+                    "reason": "target_episode_already_present",
+                    "existing_episode_keys": sorted(existing_episode_files),
+                    "existing_target_files": existing_episode_files,
+                })
+                continue
             payload = build_create_task_payload(f"magnet:?xt=urn:btih:{info_hash}", folder_id,
                                                 file_name, file_indexes=indexes)
             task_entry = {
