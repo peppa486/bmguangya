@@ -2207,16 +2207,23 @@ class AListClient:
                                                   "per_page": self.cfg["page_size"], "refresh": bool(refresh and page == 1)},
                                  stage="list")
             data = payload.get("data")
-            if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+            if not isinstance(data, dict):
                 raise ReconcileError("AList list response has no content list", code="alist_invalid_list")
             declared = data.get("total")
             if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
                 raise ReconcileError("AList list response has invalid total", code="alist_invalid_list")
+            if "content" not in data or data["content"] is None:
+                if declared != 0:
+                    raise ReconcileError("AList list response has no content list", code="alist_invalid_list")
+                chunk = []
+            else:
+                chunk = data["content"]
+                if not isinstance(chunk, list):
+                    raise ReconcileError("AList list response has no content list", code="alist_invalid_list")
             if total is None:
                 total = declared
             elif total != declared:
                 raise ReconcileError("AList list total changed during pagination", code="alist_unstable_pagination")
-            chunk = data["content"]
             if any(not isinstance(item, dict) for item in chunk) or len(chunk) > self.cfg["page_size"]:
                 raise ReconcileError("AList list response has malformed entries", code="alist_invalid_list")
             rows.extend(chunk)

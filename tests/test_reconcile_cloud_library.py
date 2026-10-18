@@ -1621,6 +1621,35 @@ class AListClientTests(unittest.TestCase):
             with self.assertRaisesRegex(rec.ReconcileError, "business code was not 200"):
                 rec.AListClient(cfg, session=bad).list_all(ROOT)
 
+    def test_list_all_accepts_null_or_missing_content_only_for_explicit_zero_total(self):
+        for data in ({"total": 0, "content": None}, {"total": 0}):
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(tmp)
+                session = self.Session([{"code": 200, "data": data}])
+
+                rows = rec.AListClient(cfg, session=session).list_all(ROOT)
+
+            self.assertEqual(rows, [])
+            self.assertEqual(len(session.calls), 1)
+
+    def test_list_all_rejects_null_or_malformed_content_without_strict_zero_total(self):
+        payloads = (
+            {"total": 1, "content": None},
+            {"total": None, "content": None},
+            {"content": None},
+            {"total": False, "content": None},
+            {"total": 0, "content": {}},
+        )
+        for data in payloads:
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(tmp)
+                session = self.Session([{"code": 200, "data": data}])
+
+                with self.assertRaises(rec.ReconcileError) as caught:
+                    rec.AListClient(cfg, session=session).list_all(ROOT)
+
+            self.assertEqual(caught.exception.code, "alist_invalid_list")
+
 
 if __name__ == "__main__":
     unittest.main()
