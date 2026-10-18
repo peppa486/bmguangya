@@ -44,7 +44,15 @@ def write_json(path: str, data: dict) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    if os.name != "nt":
+        directory_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def normalize_title(text: str) -> str:

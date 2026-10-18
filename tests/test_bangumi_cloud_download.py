@@ -183,6 +183,348 @@ class BangumiCloudDownloadOrganizationTests(unittest.TestCase):
         )
 
 
+class SubjectSyncRecoveryTests(unittest.TestCase):
+    def _action(self, subject_id, folder_id, *, op='move', from_category='在看',
+                to_category='看过', old_name='旧名称', new_name=None):
+        new_name = old_name if new_name is None else new_name
+        if op == 'move':
+            return {
+                'action': 'move', 'subject_id': str(subject_id), 'folder_id': folder_id,
+                'title': new_name, 'from_category': from_category,
+                'to_category': to_category, 'show_dir': new_name,
+                'collection_type': 2,
+            }
+        return {
+            'action': 'rename', 'subject_id': str(subject_id), 'folder_id': folder_id,
+            'title': new_name, 'category_dir': to_category,
+            'old_show_dir': old_name, 'show_dir': new_name,
+            'collection_type': 2,
+        }
+
+    def _client(self, *, folders=None, fail_move_call=None, move_error_after=False,
+                hidden_ids=None, hide_after_error_ids=None, missing_categories=None):
+        class FakeClient:
+            def __init__(self):
+                missing_category_names = set(missing_categories or [])
+                category_rows = [
+                    ('cat-watching', '在看'), ('cat-watched', '看过'),
+                    ('cat-want', '想看'), ('cat-unmarked', '未标记'),
+                ]
+                self.parents = {
+                    'root': [
+                        {'fileId': file_id, 'fileName': name, 'resType': 2}
+                        for file_id, name in category_rows if name not in missing_category_names
+                    ],
+                    'cat-watching': [], 'cat-watched': [],
+                    'cat-want': [], 'cat-unmarked': [],
+                }
+                for parent_id, rows in (folders or {}).items():
+                    self.parents[parent_id].extend(dict(row) for row in rows)
+                self.move_calls = []
+                self.rename_calls = []
+                self.fail_move_call = fail_move_call
+                self.move_error_after = move_error_after
+                self.hidden_ids = set(hidden_ids or [])
+                self.hide_after_error_ids = set(hide_after_error_ids or [])
+                self.create_calls = []
+
+            def get_file_list(self, parent_id, page_size, page):
+                rows = [row for row in self.parents.get(parent_id, [])
+                        if str(row.get('fileId')) not in self.hidden_ids]
+                return {'data': {'list': [dict(row) for row in rows], 'total': len(rows)}}
+
+            def create_dir(self, parent_id, name, fail_if_exist=False):
+                self.create_calls.append((parent_id, name, fail_if_exist))
+                file_id = f'created-{len(self.create_calls)}'
+                self.parents[parent_id].append({
+                    'fileId': file_id, 'fileName': name, 'resType': 2,
+                })
+                self.parents[file_id] = []
+                return {'data': {'fileId': file_id}}
+
+            def move_file(self, file_ids, target_parent_id):
+                self.move_calls.append((list(file_ids), target_parent_id))
+                call_number = len(self.move_calls)
+                if self.fail_move_call == call_number and not self.move_error_after:
+                    self.hidden_ids.update(self.hide_after_error_ids)
+                    raise RuntimeError('simulated move timeout before apply')
+                for file_id in file_ids:
+                    source_parent = next((parent for parent, rows in self.parents.items()
+                                          if any(str(row.get('fileId')) == str(file_id) for row in rows)), None)
+                    if source_parent is None:
+                        raise RuntimeError('folder not found')
+                    row = next(row for row in self.parents[source_parent]
+                               if str(row.get('fileId')) == str(file_id))
+                    self.parents[source_parent].remove(row)
+                    self.parents[target_parent_id].append(row)
+                if self.fail_move_call == call_number and self.move_error_after:
+                    raise RuntimeError('simulated move timeout after apply')
+
+            def rename(self, file_id, name):
+                self.rename_calls.append((str(file_id), name))
+                row = next(row for rows in self.parents.values() for row in rows
+                           if str(row.get('fileId')) == str(file_id))
+                row['fileName'] = name
+
+        return FakeClient()
+
+    def _state(self, locations):
+        return {'subject_locations': locations, 'tracked_subjects': {}, 'cloud_tasks': {}}
+
+    def test_partial_success_checkpoints_first_action_before_second_failure(self):
+        client = self._client(folders={
+            'cat-watching': [
+                {'fileId': 'folder-1', 'fileName': '一号', 'resType': 2},
+                {'fileId': 'folder-2', 'fileName': '二号', 'resType': 2},
+            ],
+        }, fail_move_call=2)
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '一号', 'category_dir': '在看', 'show_dir': '一号'},
+            '2': {'folder_id': 'folder-2', 'title': '二号', 'category_dir': '在看', 'show_dir': '二号'},
+        })
+        handle = tempfile.NamedTemporaryFile('w+', delete=False, encoding='utf-8')
+        checkpoint_path = handle.name
+        handle.close()
+        try:
+            with self.assertRaises(mod.SubjectSyncSafetyError):
+                mod.apply_subject_sync_actions(
+                    client, 'root', [self._action('1', 'folder-1', old_name='一号'),
+                                     self._action('2', 'folder-2', old_name='二号')],
+                    state, dry_run=False,
+                    checkpoint=lambda: mod.write_json(checkpoint_path, state),
+                )
+
+            persisted = mod.read_json(checkpoint_path)
+            self.assertEqual(len(client.move_calls), 2)
+            journal = persisted['subject_sync']['journal']
+            self.assertEqual([item['status'] for item in journal], ['done', 'pending'])
+            self.assertEqual(persisted['subject_locations']['1']['category_dir'], '看过')
+        finally:
+            os.unlink(checkpoint_path)
+
+    def test_unknown_pending_move_is_read_only_on_next_run(self):
+        client = self._client(
+            folders={'cat-watching': [
+                {'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2},
+            ]},
+            fail_move_call=1, hide_after_error_ids={'folder-1'},
+        )
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        persisted = {}
+        action = self._action('1', 'folder-1')
+        checkpoint = lambda: persisted.update(json.loads(json.dumps(state)))
+
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [action], state, False, checkpoint=checkpoint)
+        self.assertEqual(persisted['subject_sync']['journal'][0]['status'], 'pending')
+
+        recovered_state = json.loads(json.dumps(persisted))
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [action], recovered_state, False)
+
+        self.assertEqual(len(client.move_calls), 1)
+        self.assertEqual(recovered_state['subject_sync']['journal'][0]['status'], 'pending')
+
+    def test_pending_recovery_rejects_changed_category_folder_id(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        })
+        client.parents['root'] = [row for row in client.parents['root']
+                                  if row['fileId'] != 'cat-watched']
+        client.parents['root'].append({
+            'fileId': 'cat-watched-replaced', 'fileName': '看过', 'resType': 2,
+        })
+        client.parents['cat-watched-replaced'] = []
+        spec = {
+            'action': 'move', 'subject_id': '1', 'folder_id': 'folder-1',
+            'source_category': '在看', 'target_category': '看过',
+            'source_parent_id': 'cat-watching', 'target_parent_id': 'cat-watched',
+            'source_name': '旧名称', 'target_name': '旧名称',
+            'title': '旧名称', 'collection_type': 2, 'status': 'pending',
+        }
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        state['subject_sync'] = {'journal': [spec]}
+
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(
+                client, 'root', [self._action('1', 'folder-1')], state, False,
+            )
+
+        self.assertEqual(client.move_calls, [])
+        self.assertEqual(state['subject_sync']['journal'][0]['status'], 'pending')
+
+    def test_source_readback_does_not_authorize_replaying_pending_move(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        }, fail_move_call=1)
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        persisted = {}
+        action = self._action('1', 'folder-1')
+        checkpoint = lambda: persisted.update(json.loads(json.dumps(state)))
+
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [action], state, False, checkpoint=checkpoint)
+        self.assertEqual(state['subject_sync']['journal'][0]['status'], 'pending')
+
+        recovered_state = json.loads(json.dumps(persisted))
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [action], recovered_state, False)
+
+        self.assertEqual(len(client.move_calls), 1)
+        self.assertEqual(recovered_state['subject_sync']['journal'][0]['status'], 'pending')
+
+    def test_write_error_with_target_readback_recovers_as_done(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        }, fail_move_call=1, move_error_after=True)
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        checkpoints = []
+
+        applied = mod.apply_subject_sync_actions(
+            client, 'root', [self._action('1', 'folder-1')], state, False,
+            checkpoint=lambda: checkpoints.append(json.loads(json.dumps(state))),
+        )
+
+        self.assertEqual(len(client.move_calls), 1)
+        self.assertEqual(state['subject_sync']['journal'][0]['status'], 'done')
+        self.assertEqual(state['subject_locations']['1']['category_dir'], '看过')
+        self.assertEqual(applied[0]['sync_status'], 'done')
+        self.assertGreaterEqual(len(checkpoints), 2)
+
+    def test_folder_already_at_target_updates_location_without_cloud_write(self):
+        client = self._client(folders={
+            'cat-watched': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        })
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        checkpoints = []
+
+        applied = mod.apply_subject_sync_actions(
+            client, 'root', [self._action('1', 'folder-1')], state, False,
+            checkpoint=lambda: checkpoints.append(True),
+        )
+
+        self.assertEqual(client.move_calls, [])
+        self.assertEqual(state['subject_locations']['1']['category_dir'], '看过')
+        self.assertEqual(applied[0]['sync_status'], 'already_at_target')
+        self.assertEqual(state.get('subject_sync', {}).get('journal', []), [])
+
+    def test_dry_run_does_not_create_sync_journal_or_write_cloud(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        }, missing_categories={'未标记'})
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+
+        mod.apply_subject_sync_actions(
+            client, 'root', [self._action('1', 'folder-1', to_category='未标记')], state, True,
+        )
+
+        self.assertNotIn('subject_sync', state)
+        self.assertEqual(client.create_calls, [])
+        self.assertEqual(client.move_calls, [])
+
+    def test_missing_target_category_is_created_fail_closed_before_move(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        }, missing_categories={'未标记'})
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        action = self._action('1', 'folder-1', to_category='未标记')
+        action['collection_type'] = 0
+
+        mod.apply_subject_sync_actions(client, 'root', [action], state, False)
+
+        self.assertEqual(client.create_calls, [('root', '未标记', True)])
+        self.assertEqual(client.move_calls, [(['folder-1'], 'created-1')])
+        self.assertEqual(state['subject_locations']['1']['category_dir'], '未标记')
+
+    def test_persisted_pending_rename_recovers_from_target_without_resending(self):
+        client = self._client(folders={
+            'cat-watched': [{'fileId': 'folder-1', 'fileName': '新名称', 'resType': 2}],
+        })
+        entry = {
+            'action': 'rename', 'subject_id': '1', 'folder_id': 'folder-1',
+            'source_category': '看过', 'target_category': '看过',
+            'source_parent_id': 'cat-watched', 'target_parent_id': 'cat-watched',
+            'source_name': '旧名称', 'target_name': '新名称',
+            'title': '新名称', 'collection_type': 2, 'status': 'pending',
+        }
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '看过', 'show_dir': '旧名称'},
+        })
+        state['subject_sync'] = {'journal': [entry]}
+
+        mod.apply_subject_sync_actions(client, 'root', [], state, False)
+
+        self.assertEqual(client.rename_calls, [])
+        self.assertEqual(state['subject_sync']['journal'][0]['status'], 'done')
+        self.assertEqual(state['subject_locations']['1']['show_dir'], '新名称')
+
+    def test_name_conflict_refuses_write(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+            'cat-watched': [{'fileId': 'other-folder', 'fileName': '旧名称', 'resType': 2}],
+        })
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [self._action('1', 'folder-1')], state, False)
+
+        self.assertEqual(client.move_calls, [])
+        self.assertEqual(state.get('subject_sync', {}).get('journal', []), [])
+
+    def test_duplicate_target_name_with_expected_id_is_still_conflict(self):
+        client = self._client(folders={
+            'cat-watched': [
+                {'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2},
+                {'fileId': 'other-folder', 'fileName': '旧名称', 'resType': 2},
+            ],
+        })
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+
+        with self.assertRaises(mod.SubjectSyncSafetyError):
+            mod.apply_subject_sync_actions(client, 'root', [self._action('1', 'folder-1')], state, False)
+
+        self.assertEqual(client.move_calls, [])
+
+    def test_move_preserves_source_name_until_verified_rename(self):
+        client = self._client(folders={
+            'cat-watching': [{'fileId': 'folder-1', 'fileName': '旧名称', 'resType': 2}],
+        })
+        state = self._state({
+            '1': {'folder_id': 'folder-1', 'title': '旧名称', 'category_dir': '在看', 'show_dir': '旧名称'},
+        })
+        actions = [
+            self._action('1', 'folder-1', old_name='旧名称', new_name='新名称'),
+            self._action('1', 'folder-1', op='rename', to_category='看过',
+                         old_name='旧名称', new_name='新名称'),
+        ]
+
+        mod.apply_subject_sync_actions(client, 'root', actions, state, False)
+
+        self.assertEqual(client.move_calls, [(['folder-1'], 'cat-watched')])
+        self.assertEqual(client.rename_calls, [('folder-1', '新名称')])
+        self.assertEqual(state['subject_locations']['1']['category_dir'], '看过')
+        self.assertEqual(state['subject_locations']['1']['show_dir'], '新名称')
+        self.assertEqual([item['status'] for item in state['subject_sync']['journal']], ['done', 'done'])
+
+
 class BangumiCloudDownloadPayloadTests(unittest.TestCase):
     def test_build_create_task_payload_uses_clean_name_and_parent(self):
         payload = mod.build_create_task_payload(

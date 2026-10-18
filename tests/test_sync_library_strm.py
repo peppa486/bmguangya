@@ -208,7 +208,9 @@ class SyncLibraryStrmTests(unittest.TestCase):
             cfg = sync.validate_config(config(root / "media", root / "archive"))
             planned, unresolved, _ = sync.build_show_plan(inventory(show()), cfg)
             self.assertEqual(unresolved, [])
-            self.assertEqual(planned[0]["episodes"][0]["local_path"], "在看/Bangumi 准确标题/EP01.strm")
+            self.assertEqual(planned[0]["local_show"], "在看/Foo")
+            self.assertEqual(planned[0]["episodes"][0]["local_path"], "在看/Foo/EP01.strm")
+            self.assertEqual(planned[0]["nfo_title"], "Bangumi 准确标题")
             url = sync.authenticated_strm_url(cfg, planned[0]["episodes"][0]["relative_path"])
             parsed = urllib.parse.urlsplit(url)
             self.assertEqual((parsed.username, parsed.password), ("jellyfin-reader", "s3cret"))
@@ -216,6 +218,98 @@ class SyncLibraryStrmTests(unittest.TestCase):
                 urllib.parse.unquote(parsed.path),
                 "/dav/guangya/Anime/在看/Foo/Disc 01/01.mkv",
             )
+
+    def test_bangumi_slash_title_is_metadata_while_local_path_uses_source_basename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            first = show()
+            first.update({"name": "Fate/stay night UBW", "cloud_name": "FateUBW",
+                          "source_path": "在看/FateUBW", "path": "在看/FateUBW"})
+            first["vids"][0].update({"relative_path": "在看/FateUBW/01.mkv",
+                                     "path": "在看/FateUBW/01.mkv"})
+            first["episodes"][0].update({
+                "relative_path": "在看/FateUBW/01.mkv",
+                "present_files": [{"relative_path": "在看/FateUBW/01.mkv", "name": "01.mkv"}],
+            })
+            second = copy.deepcopy(first)
+            second.update({"cloud_name": "FateZero", "subject_id": "54321",
+                           "source_path": "在看/FateZero", "path": "在看/FateZero"})
+            second["episodes"][0]["episode_id"] = "9002"
+            second["vids"][0].update({"relative_path": "在看/FateZero/01.mkv",
+                                      "path": "在看/FateZero/01.mkv"})
+            second["episodes"][0].update({
+                "relative_path": "在看/FateZero/01.mkv",
+                "present_files": [{"relative_path": "在看/FateZero/01.mkv", "name": "01.mkv"}],
+            })
+
+            planned, unresolved, conflicts = sync.build_show_plan(inventory(first, second), cfg)
+
+            self.assertEqual(unresolved, [])
+            self.assertEqual(conflicts, [])
+            self.assertEqual([row["local_show"] for row in planned], ["在看/FateUBW", "在看/FateZero"])
+            self.assertEqual([row["nfo_title"] for row in planned], ["Fate/stay night UBW"] * 2)
+            nfo = ET.fromstring(sync.make_show_nfo("12345", planned[0]["nfo_title"]))
+            self.assertEqual(nfo.findtext("title"), "Fate/stay night UBW")
+
+    def test_real_trailing_slash_title_does_not_become_a_local_path_component(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            row = show()
+            row.update({"name": "THE LENTICULARSa/", "cloud_name": "THE LENTICULARS a",
+                        "source_path": "在看/THE LENTICULARS a",
+                        "path": "在看/THE LENTICULARS a"})
+            video_path = "在看/THE LENTICULARS a/EP01.mkv"
+            row["vids"][0].update({"name": "EP01.mkv", "relative_path": video_path, "path": video_path})
+            row["episodes"][0].update({
+                "relative_path": video_path,
+                "present_files": [{"relative_path": video_path, "name": "EP01.mkv"}],
+            })
+
+            planned, _unresolved, _conflicts = sync.build_show_plan(inventory(row), cfg)
+
+            self.assertEqual(planned[0]["title"], "THE LENTICULARSa/")
+            self.assertEqual(planned[0]["nfo_title"], "THE LENTICULARSa/")
+            self.assertEqual(planned[0]["local_show"], "在看/THE LENTICULARS a")
+            self.assertEqual(planned[0]["episodes"][0]["local_path"],
+                             "在看/THE LENTICULARS a/EP01.strm")
+
+    def test_bangumi_only_stub_allows_slash_title_without_local_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            stub = show()
+            stub.update({"name": "Fate/stay night", "source_path": None, "path": None,
+                         "count": 0, "vids": [], "episodes": []})
+
+            planned, _unresolved, _conflicts = sync.build_show_plan(inventory(stub), cfg)
+
+            self.assertEqual(planned[0]["title"], "Fate/stay night")
+            self.assertIsNone(planned[0]["local_show"])
+            self.assertIsNone(planned[0]["nfo_title"])
+            self.assertTrue(planned[0]["skip_apply"])
+
+    def test_display_title_rejects_control_characters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            bad_title = show()
+            bad_title["name"] = "Fate/UBW\x7f"
+
+            with self.assertRaisesRegex(sync.SyncError, "control character"):
+                sync.build_show_plan(inventory(bad_title), cfg)
+
+    def test_unsafe_actual_source_path_is_rejected_even_when_display_title_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = sync.validate_config(config(root / "media", root / "archive"))
+            unsafe = show()
+            unsafe.update({"name": "THE LENTICULARSa/", "source_path": "在看/../LENTICULARS",
+                           "path": "在看/../LENTICULARS"})
+
+            with self.assertRaisesRegex(sync.SyncError, "traversal"):
+                sync.build_show_plan(inventory(unsafe), cfg)
 
     def test_known_12_episode_match_does_not_claim_extra_ep22(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,7 +348,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
             ))
             self.assertFalse(planned[0]["cleanup_safe"])
 
-            current_show = media / "在看" / "Bangumi 准确标题"
+            current_show = media / "在看" / "Foo"
             current_show.mkdir(parents=True)
             old_ep22 = current_show / "EP22.strm"
             old_ep22.write_text("http://old.invalid/22.mkv\n", encoding="utf-8")
@@ -394,7 +488,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
                 sync.build_show_plan(inventory(mismatched_display_path), cfg)
 
             first, second = show(), show()
-            second["source_path"] = second["path"] = "在看/Other"
+            second["source_path"] = second["path"] = "在看/Foo"
             second["cloud_name"] = "Other"
             with self.assertRaisesRegex(sync.SyncError, "duplicate source or local title"):
                 sync.build_show_plan(inventory(first, second), cfg)
@@ -421,7 +515,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
                 stats = sync.apply_plan(planned, cfg)
                 refresh(cfg)
 
-            new_show = media / "在看" / "Bangumi 准确标题"
+            new_show = media / "在看" / "Foo"
             strm_path = new_show / "EP01.strm"
             self.assertTrue(strm_path.is_file())
             self.assertIn(
@@ -455,7 +549,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
             unknown_strm = unknown_dir / "EP01.strm"
             unknown_strm.write_text("http://old.invalid/unknown.mkv\n", encoding="utf-8")
 
-            safe_dir = media / "在看" / "Bangumi 准确标题"
+            safe_dir = media / "在看" / "Foo"
             safe_dir.mkdir(parents=True)
             stale_strm = safe_dir / "EP99.strm"
             stale_strm.write_text("http://old.invalid/stale.mkv\n", encoding="utf-8")
@@ -662,8 +756,10 @@ class SyncLibraryStrmTests(unittest.TestCase):
             cfg = sync.validate_config(raw)
             other_cloud_path = "想看/Other show/EP02.mkv"
             inv = inventory(show(), cloud_files=(other_cloud_path,))
-            duplicate = media / "Legacy title" / "EP01.strm"
-            separate_live = media / "Legacy title" / "EP02.strm"
+            # This is the old v13 title-based target; the new plan uses Foo,
+            # while URL identity still proves EP01 is a duplicate reference.
+            duplicate = media / "在看" / "Bangumi 准确标题" / "EP01.strm"
+            separate_live = media / "在看" / "Bangumi 准确标题" / "EP02.strm"
             duplicate.parent.mkdir(parents=True)
             duplicate_url = sync.authenticated_strm_url(cfg, MEDIA_REL).replace("/dav/", "/d/", 1)
             duplicate_url += "?sign=private-signature"
@@ -676,6 +772,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
 
             self.assertFalse(duplicate.exists())
             self.assertTrue(separate_live.is_file())
+            self.assertTrue((media / "在看" / "Foo" / "EP01.strm").is_file())
             self.assertEqual(stats["managed_stale_strm_archive_count"], 1)
             self.assertEqual(stats["managed_stale_strm_archives"][0]["reason"], "duplicate_desired_cloud_file")
             self.assertNotIn("private-signature", json.dumps(stats))
@@ -746,7 +843,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
             media = root / "media"
             archive = root / "archive"
             cfg = sync.validate_config(config(media, archive))
-            target = media / "在看" / "Bangumi 准确标题"
+            target = media / "在看" / "Foo"
             target.mkdir(parents=True)
             nfo = target / "tvshow.nfo"
             original = b'<tvshow><title>Provider title</title><uniqueid type="tmdb">7</uniqueid></tvshow>'
@@ -772,7 +869,7 @@ class SyncLibraryStrmTests(unittest.TestCase):
             stats = sync.apply_plan(planned, cfg)
             self.assertFalse(old_strm.exists())
             self.assertEqual(stats["archive_count"], 2)
-            self.assertTrue((media / "在看" / "Bangumi 准确标题" / "EP01.strm").is_file())
+            self.assertTrue((media / "在看" / "Foo" / "EP01.strm").is_file())
 
     def test_nested_symlink_in_media_tree_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

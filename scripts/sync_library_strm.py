@@ -15,6 +15,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
@@ -113,6 +114,15 @@ def clean_component(value: Any, *, field: str) -> str:
     if not value or value in (".", "..") or "/" in value or "\\" in value or "\x00" in value:
         raise SyncError("{} is not a safe path component".format(field))
     if any(ord(char) < 32 for char in value):
+        raise SyncError("{} contains a control character".format(field))
+    return value
+
+
+def clean_display_title(value: Any, *, field: str) -> str:
+    """Validate metadata text without treating it as a filesystem component."""
+    if not isinstance(value, str) or not value.strip():
+        raise SyncError("{} must be non-empty text".format(field))
+    if any(unicodedata.category(char) == "Cc" for char in value):
         raise SyncError("{} contains a control character".format(field))
     return value
 
@@ -388,12 +398,10 @@ def build_show_plan(inventory: dict[str, Any], config_data: dict[str, Any]) -> t
             ambiguous = show.get("ambiguous") is True
             is_matched = show.get("matched") is True and valid_subject_id and not ambiguous
             title = show.get("name") or show.get("cloud_name") or (source_parts[-1] if source_parts else raw_subject_id)
-            if not isinstance(title, str):
-                raise SyncError("inventory show title is not text")
             # Unmatched entries use the real cloud directory name, never an inferred Bangumi title.
             if source_parts is not None and show.get("matched") is not True:
                 title = show.get("cloud_name") or source_parts[-1]
-            title = clean_component(title, field="show.title")
+            title = clean_display_title(title, field="show.title")
 
             if source_parts is None:
                 if show.get("matched") is True and not valid_subject_id:
@@ -443,7 +451,9 @@ def build_show_plan(inventory: dict[str, Any], config_data: dict[str, Any]) -> t
                 conflicts.append({"source_path": source_text or "", "reason": "duplicate_inventory_source_path"})
                 continue
             seen_sources[source_parts] = raw_subject_id or str(show.get("name") or source_text)
-            local_show = PurePosixPath(category, title)
+            # Bangumi's display title is metadata and may contain separators.
+            # Local paths must come only from the validated cloud source path.
+            local_show = PurePosixPath(category, source_parts[-1])
             target_prefix = local_show.as_posix()
             prior = seen_targets.get(target_prefix)
             if prior:

@@ -26,7 +26,7 @@ import re
 import sys
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -627,10 +627,234 @@ def get_remote_episode_file_index(
     return existing
 
 
+class SubjectSyncSafetyError(RuntimeError):
+    """A folder move/rename is not verified; stop before any repeat write."""
+
+
+def _subject_sync_journal(state: dict) -> List[dict]:
+    sync_state = state.setdefault("subject_sync", {})
+    if not isinstance(sync_state, dict):
+        raise RuntimeError("invalid subject_sync state")
+    journal = sync_state.setdefault("journal", [])
+    if not isinstance(journal, list) or any(not isinstance(item, dict) for item in journal):
+        raise RuntimeError("invalid subject_sync journal")
+    return journal
+
+
+def _subject_sync_has_pending(state: dict) -> bool:
+    sync_state = state.get("subject_sync")
+    if sync_state is None:
+        return False
+    if not isinstance(sync_state, dict):
+        raise RuntimeError("invalid subject_sync state")
+    journal = sync_state.get("journal", [])
+    if not isinstance(journal, list) or any(not isinstance(item, dict) for item in journal):
+        raise RuntimeError("invalid subject_sync journal")
+    return any(item.get("status") == "pending" for item in journal)
+
+
+def _sync_checkpoint(checkpoint: Optional[Callable[[], None]]) -> None:
+    if checkpoint is not None:
+        checkpoint()
+
+
+def _sync_category_id(client: GuangYaClient, root_dir_id: str, category_name: str,
+                      *, create: bool = False) -> Optional[str]:
+    rows = list_all_children(client, root_dir_id)
+    named = [row for row in rows
+             if str(row.get("fileName") or "").casefold() == category_name.casefold()]
+    if any(int(row.get("resType") or 0) != 2 for row in named):
+        raise SubjectSyncSafetyError("subject sync category name is occupied by a non-directory")
+    if len(named) > 1:
+        raise SubjectSyncSafetyError("subject sync category name is ambiguous")
+    if named:
+        if named[0].get("fileName") != category_name:
+            raise SubjectSyncSafetyError("subject sync category name differs only by case")
+        return str(named[0].get("fileId") or "")
+    if not create:
+        return None
+
+    created_id = None
+    try:
+        created = client.create_dir(root_dir_id, category_name, fail_if_exist=True)
+        created_id = str(((created.get("data") or {}).get("fileId")) or "") or None
+    except Exception:
+        # A competing run may have created the exact category. Accept only a
+        # unique fresh readback; otherwise the caller must stop safely.
+        pass
+    rows = list_all_children(client, root_dir_id)
+    named = [row for row in rows
+             if str(row.get("fileName") or "").casefold() == category_name.casefold()]
+    if (len(named) != 1 or named[0].get("fileName") != category_name
+            or int(named[0].get("resType") or 0) != 2
+            or (created_id is not None and str(named[0].get("fileId") or "") != created_id)):
+        raise SubjectSyncSafetyError("new subject sync category could not be verified by ID")
+    return str(named[0].get("fileId") or "")
+
+
+def _subject_sync_spec(client: GuangYaClient, root_dir_id: str, action: dict,
+                       subject_locations: dict) -> dict:
+    op = str(action.get("action") or "")
+    subject_id = str(action.get("subject_id") or "")
+    folder_id = str(action.get("folder_id") or "")
+    location = subject_locations.get(subject_id) or {}
+    if op == "move":
+        source_category = (action.get("from_category") or location.get("category_dir") or "")
+        target_category = str(action.get("to_category") or "")
+        source_name = str(action.get("source_show_dir") or action.get("old_show_dir")
+                           or location.get("show_dir") or action.get("show_dir") or "")
+        # A move preserves the folder's actual current name. A separate rename
+        # action, if any, is responsible for changing it afterward.
+        target_name = source_name
+    elif op == "rename":
+        source_category = str(action.get("category_dir") or location.get("category_dir") or "")
+        target_category = source_category
+        source_name = str(action.get("source_show_dir") or action.get("old_show_dir")
+                           or location.get("show_dir") or "")
+        target_name = str(action.get("show_dir") or "")
+    else:
+        raise SubjectSyncSafetyError("unsupported subject sync operation")
+    if not subject_id or not folder_id or not source_category or not target_category or not source_name or not target_name:
+        raise SubjectSyncSafetyError("subject sync action is missing folder identity or path")
+
+    source_parent_id = _sync_category_id(client, root_dir_id, str(source_category))
+    target_parent_id = _sync_category_id(
+        client, root_dir_id, str(target_category), create=(op == "move"),
+    )
+    if not source_parent_id or not target_parent_id:
+        raise SubjectSyncSafetyError("subject sync source or target category is missing")
+    return {
+        "action": op,
+        "subject_id": subject_id,
+        "folder_id": folder_id,
+        "source_category": str(source_category),
+        "target_category": str(target_category),
+        "source_parent_id": source_parent_id,
+        "target_parent_id": target_parent_id,
+        "source_name": source_name,
+        "target_name": target_name,
+        "title": action.get("title") or location.get("title") or source_name,
+        "collection_type": action.get("collection_type", location.get("collection_type")),
+    }
+
+
+def _subject_sync_probe(client: GuangYaClient, spec: dict) -> str:
+    """Freshly identify the folder by ID and classify source/target/conflict."""
+    source_parent = str(spec["source_parent_id"])
+    target_parent = str(spec["target_parent_id"])
+    source_rows = list_all_children(client, source_parent)
+    target_rows = source_rows if target_parent == source_parent else list_all_children(client, target_parent)
+    folder_id = str(spec["folder_id"])
+
+    source_matches = [row for row in source_rows if str(row.get("fileId") or "") == folder_id]
+    target_matches = [row for row in target_rows if str(row.get("fileId") or "") == folder_id]
+    if len(source_matches) > 1 or len(target_matches) > 1:
+        return "unknown"
+    source_item = source_matches[0] if source_matches else None
+    target_item = target_matches[0] if target_matches else None
+    if source_item is None and target_item is None:
+        # Even without the expected folder ID, a colliding name must not be
+        # mistaken for an empty target.
+        target_name = str(spec["target_name"]).casefold()
+        if any(str(row.get("fileName") or "").casefold() == target_name for row in target_rows):
+            return "conflict"
+        return "unknown"
+    if source_parent != target_parent and source_item is not None and target_item is not None:
+        return "unknown"
+
+    for row in (source_item, target_item):
+        if row is not None and int(row.get("resType") or 0) != 2:
+            return "unknown"
+
+    source_name = str(spec["source_name"]).casefold()
+    target_name = str(spec["target_name"]).casefold()
+    source_collisions = [row for row in source_rows
+                         if str(row.get("fileName") or "").casefold() == source_name
+                         and str(row.get("fileId") or "") != folder_id]
+    target_collisions = [row for row in target_rows
+                         if str(row.get("fileName") or "").casefold() == target_name
+                         and str(row.get("fileId") or "") != folder_id]
+    if source_collisions or target_collisions:
+        return "conflict"
+
+    if target_item is not None and target_item.get("fileName") == spec["target_name"]:
+        return "target"
+
+    if source_item is not None and source_item.get("fileName") == spec["source_name"]:
+        return "source"
+    return "unknown"
+
+
+def _commit_subject_sync_location(state: dict, spec: dict) -> None:
+    subject_id = spec["subject_id"]
+    locations = state.setdefault("subject_locations", {})
+    location = dict(locations.get(subject_id) or {})
+    location.update({
+        "subject_id": subject_id,
+        "folder_id": spec["folder_id"],
+        "title": spec["title"],
+        "category_dir": spec["target_category"],
+        "show_dir": spec["target_name"],
+    })
+    if spec.get("collection_type") is not None:
+        location["collection_type"] = spec["collection_type"]
+    locations[subject_id] = location
+
+
+def _recover_subject_sync_pending(client: GuangYaClient, root_dir_id: str, state: dict,
+                                  checkpoint: Optional[Callable[[], None]]) -> None:
+    journal = _subject_sync_journal(state)
+    for entry in journal:
+        if entry.get("status") != "pending":
+            continue
+        required = ("action", "subject_id", "folder_id", "source_parent_id", "target_parent_id",
+                    "source_name", "target_name", "source_category", "target_category")
+        if any(not entry.get(key) for key in required):
+            raise SubjectSyncSafetyError("pending subject sync journal entry is incomplete")
+        try:
+            current_source_parent = _sync_category_id(
+                client, root_dir_id, str(entry["source_category"]),
+            )
+            current_target_parent = _sync_category_id(
+                client, root_dir_id, str(entry["target_category"]),
+            )
+            if (current_source_parent != str(entry["source_parent_id"])
+                    or current_target_parent != str(entry["target_parent_id"])):
+                raise SubjectSyncSafetyError(
+                    "pending subject sync category ID changed; outcome remains unresolved"
+                )
+            outcome = _subject_sync_probe(client, entry)
+        except Exception as exc:
+            raise SubjectSyncSafetyError(
+                "pending subject sync outcome is still unknown; no folder write was repeated"
+            ) from exc
+        if outcome == "target":
+            _commit_subject_sync_location(state, entry)
+            entry["status"] = "done"
+            entry["recovered"] = "target_verified"
+            _sync_checkpoint(checkpoint)
+        elif outcome == "source":
+            # A remote move may still be queued after a timeout. Seeing the
+            # original path is not enough to authorize a second write.
+            entry["last_readback"] = "source_still_present"
+            _sync_checkpoint(checkpoint)
+            raise SubjectSyncSafetyError(
+                "pending subject sync is still at its source; no folder write was repeated"
+            )
+        else:
+            raise SubjectSyncSafetyError(
+                "pending subject sync outcome is still unknown; no folder write was repeated"
+            )
+
+
 def apply_subject_sync_actions(client: Optional[GuangYaClient], root_dir_id: str, actions: List[dict], state: dict, dry_run: bool,
-                               children_cache: Optional[Dict[str, List[dict]]] = None) -> List[dict]:
+                               children_cache: Optional[Dict[str, List[dict]]] = None,
+                               checkpoint: Optional[Callable[[], None]] = None) -> List[dict]:
     applied: List[dict] = []
     subject_locations = state.setdefault("subject_locations", {})
+
+    if not dry_run and client is not None:
+        _recover_subject_sync_pending(client, root_dir_id, state, checkpoint)
 
     for action in actions:
         subject_id = str(action["subject_id"])
@@ -645,44 +869,82 @@ def apply_subject_sync_actions(client: Optional[GuangYaClient], root_dir_id: str
             applied.append(record)
             continue
 
-        if dry_run or client is None:
-            if op in {"move", "rename"}:
-                location = subject_locations.get(subject_id, {}).copy()
-                if op == "move":
-                    location["collection_type"] = action.get("collection_type")
-                    location["category_dir"] = action.get("to_category")
-                    location["show_dir"] = action.get("show_dir")
-                else:
-                    location["show_dir"] = action.get("show_dir")
-                subject_locations[subject_id] = location
+        if op not in {"move", "rename"}:
             applied.append(record)
             continue
 
-        if op == "move":
-            target_category_id = ensure_child_dir(client, root_dir_id, action["to_category"], children_cache)
-            conflict = find_child_dir_id(client, target_category_id, action["show_dir"], children_cache)
-            if conflict and conflict != str(action["folder_id"]):
-                raise RuntimeError("refusing to move a show into an occupied GuangYa folder name")
-            client.move_file([action["folder_id"]], target_category_id)
+        if dry_run or client is None:
+            location = subject_locations.get(subject_id, {}).copy()
+            if op == "move":
+                source_name = (action.get("source_show_dir") or action.get("old_show_dir")
+                               or location.get("show_dir") or action.get("show_dir"))
+                location["collection_type"] = action.get("collection_type")
+                location["category_dir"] = action.get("to_category")
+                location["show_dir"] = source_name
+            else:
+                location["show_dir"] = action.get("show_dir")
+            subject_locations[subject_id] = location
+            applied.append(record)
+            continue
+
+        spec = _subject_sync_spec(client, root_dir_id, action, subject_locations)
+        try:
+            outcome = _subject_sync_probe(client, spec)
+        except Exception as exc:
+            raise SubjectSyncSafetyError("cannot freshly verify subject folder path; no write attempted") from exc
+        if outcome == "target":
+            _commit_subject_sync_location(state, spec)
+            record["sync_status"] = "already_at_target"
+            _sync_checkpoint(checkpoint)
             if children_cache is not None:
                 children_cache.clear()
-            location = subject_locations.get(subject_id, {}).copy()
-            location["collection_type"] = action.get("collection_type")
-            location["category_dir"] = action.get("to_category")
-            location["show_dir"] = action.get("show_dir")
-            subject_locations[subject_id] = location
-        elif op == "rename":
-            parent_id = ensure_child_dir(client, root_dir_id, action["category_dir"], children_cache)
-            conflict = find_child_dir_id(client, parent_id, action["show_dir"], children_cache)
-            if conflict and conflict != str(action["folder_id"]):
-                raise RuntimeError("refusing to rename a show over an occupied GuangYa folder name")
-            client.rename(action["folder_id"], action["show_dir"])
+            applied.append(record)
+            continue
+        if outcome == "conflict":
+            raise SubjectSyncSafetyError("refusing subject folder write: target name belongs to another object")
+        if outcome != "source":
+            raise SubjectSyncSafetyError("refusing subject folder write: source folder ID/name is not verified")
+
+        journal_entry = dict(spec, status="pending")
+        _subject_sync_journal(state).append(journal_entry)
+        # Persist the pending intent before the one remote mutation.
+        _sync_checkpoint(checkpoint)
+        write_error = None
+        try:
+            if op == "move":
+                client.move_file([spec["folder_id"]], spec["target_parent_id"])
+            else:
+                client.rename(spec["folder_id"], spec["target_name"])
+        except Exception as exc:
+            write_error = exc
+
+        try:
+            outcome = _subject_sync_probe(client, spec)
+        except Exception as exc:
+            journal_entry["last_error"] = type(exc).__name__
+            _sync_checkpoint(checkpoint)
+            raise SubjectSyncSafetyError(
+                "subject folder write outcome is unknown; pending journal retained and no retry allowed"
+            ) from exc
+
+        if outcome == "target":
+            _commit_subject_sync_location(state, spec)
+            journal_entry["status"] = "done"
+            journal_entry["verified"] = "target"
             if children_cache is not None:
                 children_cache.clear()
-            location = subject_locations.get(subject_id, {}).copy()
-            location["show_dir"] = action.get("show_dir")
-            subject_locations[subject_id] = location
-        applied.append(record)
+            _sync_checkpoint(checkpoint)
+            record["sync_status"] = "done"
+            applied.append(record)
+            continue
+
+        journal_entry["last_error"] = type(write_error).__name__ if write_error else "readback_not_at_target"
+        if outcome == "source":
+            journal_entry["last_readback"] = "source_still_present"
+        _sync_checkpoint(checkpoint)
+        raise SubjectSyncSafetyError(
+            "subject folder write outcome is unknown; pending journal retained and no retry allowed"
+        ) from write_error
 
     return applied
 
@@ -1646,7 +1908,15 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     remote_tasks = client.list_all_tasks() if client is not None else []
     refresh_cloud_tasks(client, state, remote_tasks=remote_tasks)
     children_cache: Dict[str, List[dict]] = {}
-    root_id = get_root_dir_id(client, (cfg.get("guangya") or {}).get("root_dir", DEFAULT_ROOT_DIR), children_cache) if client else "dry-run-root"
+    if client is not None and _subject_sync_has_pending(state):
+        root_name = (cfg.get("guangya") or {}).get("root_dir", DEFAULT_ROOT_DIR)
+        root_id = find_directory(list_all_children(client, ""), root_name)
+        if not root_id:
+            raise SubjectSyncSafetyError("pending subject sync root directory cannot be verified")
+    else:
+        root_id = get_root_dir_id(
+            client, (cfg.get("guangya") or {}).get("root_dir", DEFAULT_ROOT_DIR), children_cache,
+        ) if client else "dry-run-root"
 
     # Seed subject locations from the verified tree on the first managed run so
     # later collection changes move the existing folder instead of making a copy.
@@ -1678,7 +1948,9 @@ def process_collections(cfg: dict, client: Optional[GuangYaClient], dry_run: boo
     removed_subject_ids = sorted(previous_ids - set(tracked_subjects))
     actions = plan_subject_sync_actions(tracked_subjects, state.get("subject_locations", {}), removed_subject_ids)
     applied_actions = apply_subject_sync_actions(client, root_id, actions, state, dry_run=dry_run,
-                                                 children_cache=children_cache)
+                                                 children_cache=children_cache,
+                                                 checkpoint=(lambda: write_json(state_path, state))
+                                                 if not dry_run else None)
     state["tracked_subjects"] = tracked_subjects
     state["removed_subject_ids"] = removed_subject_ids
     if not dry_run:
