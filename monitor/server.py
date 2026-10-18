@@ -26,6 +26,8 @@ _SECRET_ASSIGNMENT = re.compile(
 _BEARER_SECRET = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}")
 _URL_CREDENTIALS = re.compile(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@")
 _JWT_SECRET = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
+_SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+_RECONCILE_ACTION_STATES = ("planned", "pending", "done", "blocked", "noop")
 
 
 def read_json(path: Path) -> tuple[Any | None, str | None]:
@@ -183,18 +185,164 @@ def enrich_freshness(inventory: dict[str, Any], *, now: dt.datetime | None = Non
     return result
 
 
+def _timestamp_text(value: Any) -> tuple[dt.datetime | None, str | None]:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None, None
+    return parsed, parsed.isoformat().replace("+00:00", "Z")
+
+
+def enrich_reconcile_report(
+    report: Any,
+    *,
+    report_error: str | None,
+    inventory_updated_at: Any,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Project only reconciliation status counts and timestamps for the monitor."""
+    _, inventory_timestamp = _timestamp_text(inventory_updated_at)
+
+    def unavailable(error: str) -> dict[str, Any]:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "error": error,
+            "mode": None,
+            "updated_at": None,
+            "action_counts": None,
+            "actions_total": None,
+            "unresolved_blocked_count": None,
+            "error_codes": {},
+            "inventory_snapshot_at": inventory_timestamp,
+            "inventory_reflects_apply": None,
+        }
+
+    if not isinstance(report, dict):
+        return unavailable(report_error if isinstance(report_error, str)
+                           and report_error in {"not_found", "unreadable_or_invalid"}
+                           else "invalid_shape")
+    mode = report.get("mode")
+    if mode not in ("apply", "dry-run"):
+        return unavailable("invalid_shape")
+    report_timestamp, report_timestamp_text = _timestamp_text(report.get("updated_at"))
+    actions = report.get("actions")
+    errors = report.get("errors", [])
+    unresolved = report.get("unresolved", [])
+    if (report_timestamp is None or not isinstance(actions, list)
+            or not isinstance(errors, list) or not isinstance(unresolved, list)):
+        return unavailable("invalid_shape")
+
+    action_counts = {state: 0 for state in _RECONCILE_ACTION_STATES}
+    for action in actions:
+        state = action.get("state") if isinstance(action, dict) else None
+        if not isinstance(state, str) or state not in action_counts:
+            return unavailable("invalid_shape")
+        action_counts[state] += 1
+
+    unresolved_blocked_count = 0
+    for item in unresolved:
+        if not isinstance(item, dict):
+            return unavailable("invalid_shape")
+        if item.get("state") == "blocked":
+            unresolved_blocked_count += 1
+
+    # A blocked action and its error-log row can describe the same incident.
+    # Deduplicate rows that carry the same action_id while retaining separate
+    # unresolved findings and standalone errors.
+    error_codes: dict[str, int] = {}
+    seen_errors: set[tuple[str, str]] = set()
+
+    def add_error_code(value: Any, identity: str) -> None:
+        code = value if isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value) else "other"
+        key = (code, identity)
+        if key in seen_errors:
+            return
+        seen_errors.add(key)
+        error_codes[code] = error_codes.get(code, 0) + 1
+
+    for index, action in enumerate(actions):
+        if action.get("state") != "blocked":
+            continue
+        blocked = action.get("blocked")
+        code = blocked.get("code") if isinstance(blocked, dict) else action.get("code")
+        identity = str(action.get("action_id") or "action-{}".format(index))
+        add_error_code(code, "action:" + identity)
+    for index, item in enumerate(errors):
+        if not isinstance(item, dict):
+            return unavailable("invalid_shape")
+        identity = item.get("action_id")
+        add_error_code(item.get("code"), "action:" + str(identity) if identity else "error:{}".format(index))
+    for index, item in enumerate(unresolved):
+        if item.get("state") != "blocked":
+            continue
+        identity = "unresolved:{}".format(index)
+        add_error_code(item.get("code"), identity)
+
+    has_review_items = bool(action_counts["blocked"] or unresolved_blocked_count or error_codes)
+    has_unfinished_actions = bool(action_counts["planned"] or action_counts["pending"])
+    report_complete = report.get("complete") is True
+    inventory_timestamp_dt, _ = _timestamp_text(inventory_updated_at)
+    current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    timestamps_are_plausible = (
+        report_timestamp <= current
+        and inventory_timestamp_dt is not None
+        and inventory_timestamp_dt <= current
+    )
+    inventory_reflects_apply: bool | None
+    if mode == "dry-run":
+        status = "preview_needs_review" if has_review_items else "preview"
+        inventory_reflects_apply = None
+    elif has_review_items:
+        status = "needs_review"
+        inventory_reflects_apply = False
+    elif has_unfinished_actions or not report_complete:
+        status = "incomplete"
+        inventory_reflects_apply = False
+    elif (timestamps_are_plausible
+          and inventory_timestamp_dt > report_timestamp):
+        status = "inventoried"
+        inventory_reflects_apply = True
+    else:
+        status = "awaiting_inventory"
+        inventory_reflects_apply = False
+
+    return {
+        "available": True,
+        "status": status,
+        "error": None,
+        "mode": mode,
+        "updated_at": report_timestamp_text,
+        "action_counts": action_counts,
+        "actions_total": len(actions),
+        "unresolved_blocked_count": unresolved_blocked_count,
+        "error_codes": dict(sorted(error_codes.items())),
+        "inventory_snapshot_at": inventory_timestamp,
+        "inventory_reflects_apply": inventory_reflects_apply,
+    }
+
+
 def build_api_data(
     inventory_path: Path,
     progress_path: Path,
     failure_path: Path,
     *,
     inventory_progress_path: Path | None = None,
+    reconcile_report_path: Path | None = None,
     now: dt.datetime | None = None,
 ) -> tuple[dict[str, Any], int]:
     inventory, inventory_error = read_json(inventory_path)
     progress, progress_error = read_json(progress_path)
     scan_progress, scan_progress_error = read_json(inventory_progress_path) if inventory_progress_path else (None, "not_found")
     failure, failure_error = read_json(failure_path)
+    report_path = reconcile_report_path or inventory_path.parent / "reconcile-report.json"
+    reconcile_report, reconcile_report_error = read_json(report_path)
+    inventory_timestamp = (inventory.get("generated_at") or inventory.get("updated_at")
+                           if isinstance(inventory, dict) else None)
+    reconciliation = enrich_reconcile_report(
+        reconcile_report, report_error=reconcile_report_error,
+        inventory_updated_at=inventory_timestamp,
+        now=now,
+    )
     safe_scan_progress = enrich_inventory_progress(scan_progress, now=now) if isinstance(scan_progress, dict) else None
     safe_scan_progress_error = (
         None if safe_scan_progress is not None or scan_progress_error == "not_found"
@@ -208,6 +356,7 @@ def build_api_data(
             "progress": progress if isinstance(progress, dict) else None,
             "inventory_progress": safe_scan_progress,
             "inventory_progress_error": safe_scan_progress_error,
+            "reconciliation": reconciliation,
         }, 503)
 
     payload = enrich_freshness(inventory, now=now)
@@ -217,6 +366,7 @@ def build_api_data(
     payload["inventory_progress_error"] = safe_scan_progress_error
     payload["latest_attempt"] = failure if isinstance(failure, dict) else None
     payload["latest_attempt_error"] = None if isinstance(failure, dict) or failure_error == "not_found" else failure_error
+    payload["reconciliation"] = reconciliation
     freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
     payload["ok"] = bool(payload.get("complete") is True and freshness.get("state") == "fresh")
     payload["inventory_error"] = None
@@ -229,7 +379,9 @@ def _json_bytes(payload: Any) -> bytes:
 
 def make_handler(
     *, inventory_path: Path, progress_path: Path, failure_path: Path,
-    inventory_progress_path: Path | None = None, index_path: Path = INDEX_PATH
+    inventory_progress_path: Path | None = None,
+    reconcile_report_path: Path | None = None,
+    index_path: Path = INDEX_PATH,
 ) -> type[BaseHTTPRequestHandler]:
     resolved_index = index_path.resolve()
     monitor_dir = Path(__file__).resolve().parent
@@ -275,6 +427,7 @@ def make_handler(
                 payload, status = build_api_data(
                     inventory_path, progress_path, failure_path,
                     inventory_progress_path=inventory_progress_path,
+                    reconcile_report_path=reconcile_report_path,
                 )
                 if path == "/api/health":
                     scan = payload.get("inventory_progress")
@@ -285,6 +438,7 @@ def make_handler(
                         "freshness": payload.get("freshness"),
                         "updated_at": payload.get("updated_at"),
                         "latest_attempt": payload.get("latest_attempt"),
+                        "reconciliation": payload.get("reconciliation"),
                         "inventory_progress": ({
                             "status": scan.get("status"),
                             "phase": scan.get("phase"),
@@ -320,12 +474,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inventory", type=Path)
     parser.add_argument("--progress", type=Path)
     parser.add_argument("--inventory-progress", type=Path)
+    parser.add_argument("--reconcile-report", type=Path)
     parser.add_argument("--failure", type=Path)
     parser.add_argument("--index", type=Path, default=INDEX_PATH)
     args = parser.parse_args(argv)
     inventory_path = args.inventory or args.state_dir / "library.json"
     progress_path = args.progress or args.state_dir / "sync-progress.json"
     inventory_progress_path = args.inventory_progress or args.state_dir / "library.progress.json"
+    reconcile_report_path = args.reconcile_report or args.state_dir / "reconcile-report.json"
     failure_path = args.failure or Path(str(inventory_path) + ".failure.json")
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         parser.error("the monitor must bind to loopback")
@@ -336,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         progress_path=progress_path,
         failure_path=failure_path,
         inventory_progress_path=inventory_progress_path,
+        reconcile_report_path=reconcile_report_path,
         index_path=args.index,
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)

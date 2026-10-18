@@ -19,6 +19,12 @@
     .scan-errors ul{margin:4px 0 0;padding-left:19px}
     .scan-active{margin-top:9px;font-size:12px;color:var(--sub)}
     .scan-active summary{cursor:pointer}
+    .reconcile-note{margin-top:10px;color:var(--sub);font-size:12px;line-height:1.6}
+    .reconcile-progress.preview,.reconcile-progress.preview_needs_review{border-color:rgba(96,165,250,.5)}
+    .reconcile-progress.incomplete,.reconcile-progress.awaiting_inventory,.reconcile-progress.unavailable{border-color:rgba(251,191,36,.5)}
+    .reconcile-progress.needs_review{border-color:rgba(251,113,133,.55)}
+    .reconcile-progress.inventoried{border-color:rgba(52,211,153,.5)}
+    .snapshot-banner{color:var(--sub)}
     .progress.stale{border-color:rgba(251,191,36,.5)}
     .progress.incomplete{border-color:rgba(251,113,133,.5)}
     .progress.complete{border-color:rgba(52,211,153,.45)}
@@ -48,15 +54,22 @@
     <details class="scan-active" id="inventoryActivePathsSection" hidden><summary>查看当前扫描目录</summary><ul class="scan-list" id="inventoryActivePaths"></ul></details>
     <div class="scan-errors" id="inventoryProgressErrors" hidden></div>
   </section>
+  <section class="progress reconcile-progress unavailable" id="reconcileProgressSection" aria-label="云盘整理状态">
+    <div class="progress-head"><span class="progress-title" id="reconcileProgressTitle">云盘整理：正在读取报告</span><span id="reconcileProgressMeta">-</span></div>
+    <div class="scan-grid" id="reconcileActionCounts"></div>
+    <div class="scan-errors" id="reconcileErrorCodes" hidden></div>
+    <div class="reconcile-note" id="reconcileSnapshotRelation">整理报告只读摘要；不会改变云盘。</div>
+  </section>
+  <section class="banner snapshot-banner" id="inventorySnapshotNotice" role="note">目录树展示最近一次完整库存快照，不代表实时云盘状态。</section>
   <nav class="tabs" id="tabs" aria-label="Bangumi 分类"></nav>
   <div class="toolbar"><span id="categorySummary">-</span><span id="resultCount"></span></div>
   <section class="tree" id="tree" aria-live="polite"><div class="empty">读取中…</div></section>
-  <footer class="footer">此页面仅读取库存清单、目录扫描和下载流水线状态。缺集数使用库存中的实际差集，未知总集数不会推算为已完成。</footer>
+  <footer class="footer">此页面仅读取库存清单、目录扫描、下载流水线与整理报告摘要。缺集数使用库存中的实际差集，未知总集数不会推算为已完成。</footer>
 </main>
 <script>
   const CATEGORIES=['在看','未标记','想看','看过'];
   const $=id=>document.getElementById(id);
-  let data=null, progressSnapshot=null, inventoryProgressSnapshot=null, unavailableMessage=null, activeCategory='在看', query='';
+  let data=null, progressSnapshot=null, inventoryProgressSnapshot=null, reconciliationSnapshot=null, unavailableMessage=null, activeCategory='在看', query='';
   let refreshInFlight=false;
   const REFRESH_TIMEOUT_MS=22000;
   const expandedTreePaths=new Set();
@@ -135,6 +148,54 @@
       return text?`<li>${text}</li>`:'';
     }).filter(Boolean).join('');
     errorBox.innerHTML=`${countText?`错误统计：${countText}`:''}${errorRows?`<ul>${errorRows}</ul>`:''}`;
+  }
+
+  function renderReconciliation(){
+    const section=$('reconcileProgressSection');
+    const report=reconciliationSnapshot;
+    const status=report&&report.available?String(report.status||'unavailable'):'unavailable';
+    const labels={
+      unavailable:'整理报告不可用',preview:'Dry-run 预览（未执行）',
+      preview_needs_review:'Dry-run 预览 · 存在需核对项',incomplete:'报告仍有未完成动作',
+      needs_review:'存在阻塞项或错误，需核对',awaiting_inventory:'动作已完成，等待整理后重扫',
+      inventoried:'整理后已重新盘点'
+    };
+    const allowed=['unavailable','preview','preview_needs_review','incomplete','needs_review','awaiting_inventory','inventoried'];
+    section.className=`progress reconcile-progress ${allowed.includes(status)?status:'unavailable'}`;
+    $('reconcileProgressTitle').textContent=`云盘整理：${labels[status]||labels.unavailable}`;
+    const mode=report&&report.mode==='apply'?'apply':report&&report.mode==='dry-run'?'dry-run':null;
+    $('reconcileProgressMeta').textContent=report&&report.available
+      ?`${mode||'模式未知'} 报告 · 更新 ${fmtTime(report.updated_at)}`
+      :`报告不可用 · ${report&&report.error==='not_found'?'尚无报告':report&&report.error==='unreadable_or_invalid'?'文件无法读取或格式损坏':'报告结构未知'}`;
+    const counts=report&&report.available&&report.action_counts?report.action_counts:null;
+    const count=key=>counts&&Number.isInteger(counts[key])?counts[key]:'—';
+    const rows=[['计划',count('planned')],['待确认',count('pending')],['完成',count('done')],['阻塞',count('blocked')],['无需操作',count('noop')]];
+    $('reconcileActionCounts').innerHTML=rows.map(([label,value])=>`<div class="scan-item">${esc(label)}：<strong>${esc(value)}</strong></div>`).join('');
+    const errorCodes=report&&report.available&&report.error_codes&&typeof report.error_codes==='object'?Object.entries(report.error_codes):[];
+    const errorBox=$('reconcileErrorCodes');
+    errorBox.hidden=!errorCodes.length;
+    errorBox.textContent=errorCodes.length?'错误码：'+errorCodes.map(([code,value])=>`${code} × ${value}`).join(' · '):'';
+    const relation=$('reconcileSnapshotRelation');
+    if(!report||!report.available){
+      relation.textContent='整理报告不可用；不能据此判断整理结果。下方目录树只代表最近一次库存快照。';
+    }else if(report.mode==='dry-run'){
+      relation.textContent='Dry-run 仅是计划预览，没有执行云盘整理；目录树仍来自最近库存快照。';
+    }else if(report.inventory_reflects_apply===true){
+      relation.textContent=`库存快照 ${fmtTime(report.inventory_snapshot_at)} 晚于整理报告，且没有未完成或需核对的动作。`;
+    }else if(report.status==='needs_review'){
+      relation.textContent='整理报告有阻塞项或错误；即使目录树较新，也不能视为整理已全部完成。';
+    }else if(report.status==='incomplete'){
+      relation.textContent='整理报告尚未完整结束，可能仍有计划中或待确认的动作；目录树可能未反映整理结果。';
+    }else{
+      relation.textContent=`目录树来自库存快照 ${fmtTime(report.inventory_snapshot_at)}；尚无晚于整理报告的完整重扫，当前树可能未反映整理结果。`;
+    }
+  }
+
+  function renderInventorySnapshotNotice(){
+    const notice=$('inventorySnapshotNotice');
+    notice.textContent=data
+      ?`目录树来自最近一次成功库存快照：${fmtTime(data.generated_at||data.updated_at)}。这不是实时云端视图。`
+      :'当前没有可展示的完整库存快照；整理报告状态独立显示，不代表库存可用。';
   }
 
   function renderMetrics(){
@@ -224,7 +285,7 @@
     restoreTreeExpansion(container);
   }
 
-  function render(){renderBanner();renderMetrics();renderProgress();renderInventoryProgress();renderTabs();renderTree();}
+  function render(){renderBanner();renderMetrics();renderProgress();renderInventoryProgress();renderReconciliation();renderInventorySnapshotNotice();renderTabs();renderTree();}
   function unavailableCopy(result,status){
     if(result&&result.error==='inventory_unavailable'){
       if(result.inventory_error==='invalid_shape'||result.inventory_error==='invalid_json')return'云盘清单暂时无法读取，请稍后刷新';
@@ -245,8 +306,8 @@
       responseStatus=response.status;
       result=await response.json();
       if(!response.ok||result.error==='inventory_unavailable')throw new Error('unavailable');
-      data=result;progressSnapshot=result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;unavailableMessage=null;render();
-    }catch(error){data=null;unavailableMessage=unavailableCopy(result,responseStatus);progressSnapshot=result&&result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result&&result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;render();}
+      data=result;progressSnapshot=result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;reconciliationSnapshot=result.reconciliation&&typeof result.reconciliation==='object'?result.reconciliation:null;unavailableMessage=null;render();
+    }catch(error){data=null;unavailableMessage=unavailableCopy(result,responseStatus);progressSnapshot=result&&result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result&&result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;reconciliationSnapshot=result&&result.reconciliation&&typeof result.reconciliation==='object'?result.reconciliation:null;render();}
     finally{clearTimeout(timeout);refreshInFlight=false;$('refresh').disabled=false;$('refresh').textContent='刷新数据';}
   }
   $('tree').addEventListener('toggle',event=>{

@@ -22,6 +22,7 @@ class MonitorServerTests(unittest.TestCase):
         self.progress_path = state_dir / "sync-progress.json"
         self.inventory_progress_path = state_dir / "library.progress.json"
         self.failure_path = state_dir / "library.json.failure.json"
+        self.reconcile_report_path = state_dir / "reconcile-report.json"
         self.index_path = Path(monitor.__file__).with_name("index.html")
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
@@ -30,6 +31,7 @@ class MonitorServerTests(unittest.TestCase):
                 progress_path=self.progress_path,
                 inventory_progress_path=self.inventory_progress_path,
                 failure_path=self.failure_path,
+                reconcile_report_path=self.reconcile_report_path,
                 index_path=self.index_path,
             ),
         )
@@ -77,6 +79,9 @@ class MonitorServerTests(unittest.TestCase):
         }
         payload.update(updates)
         self.inventory_progress_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def write_reconcile_report(self, report):
+        self.reconcile_report_path.write_text(json.dumps(report), encoding="utf-8")
 
     def test_api_returns_live_inventory_progress_and_no_store(self):
         self.write_inventory()
@@ -203,6 +208,125 @@ class MonitorServerTests(unittest.TestCase):
         self.assertEqual(fresh["status"], "running")
         self.assertEqual(stale["status"], "stale")
         self.assertEqual(missing["status"], "stale")
+
+    def test_reconcile_api_projects_only_safe_fields_and_counts_current_actions(self):
+        self.write_inventory()
+        secret = "access_token=super-secret-value"
+        self.write_reconcile_report({
+            "mode": "apply", "updated_at": "2026-10-18T00:00:00Z", "complete": True,
+            "actions": [
+                {"action_id": "a", "state": "planned", "source_path": secret},
+                {"action_id": "b", "state": "pending", "pending_error": {"message": secret}},
+                {"action_id": "c", "state": "done", "target_url": "https://secret.invalid/x"},
+            ],
+            "errors": [], "unresolved": [], "journal": secret,
+        })
+        payload, status = monitor.build_api_data(
+            self.inventory_path, self.progress_path, self.failure_path,
+            reconcile_report_path=self.reconcile_report_path,
+        )
+        summary = payload["reconciliation"]
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(summary["status"], "incomplete")
+        self.assertEqual(summary["action_counts"], {
+            "planned": 1, "pending": 1, "done": 1, "blocked": 0, "noop": 0,
+        })
+        self.assertFalse(summary["inventory_reflects_apply"])
+        self.assertEqual(set(summary), {
+            "available", "status", "error", "mode", "updated_at", "action_counts",
+            "actions_total", "unresolved_blocked_count", "error_codes",
+            "inventory_snapshot_at", "inventory_reflects_apply",
+        })
+        self.assertNotIn("super-secret-value", json.dumps(payload))
+        self.assertNotIn("secret.invalid", json.dumps(payload))
+        self.assertNotIn("journal", json.dumps(summary))
+
+    def test_apply_requires_a_later_successful_inventory_snapshot(self):
+        now = dt.datetime(2026, 10, 18, 12, tzinfo=dt.timezone.utc)
+        report = {
+            "mode": "apply", "updated_at": "2026-10-18T11:00:00Z", "complete": True,
+            "actions": [{"state": "done"}], "errors": [], "unresolved": [],
+        }
+        later = monitor.enrich_reconcile_report(
+            report, report_error=None, inventory_updated_at="2026-10-18T11:01:00Z", now=now,
+        )
+        same_or_older = monitor.enrich_reconcile_report(
+            report, report_error=None, inventory_updated_at="2026-10-18T10:59:00Z", now=now,
+        )
+        missing = monitor.enrich_reconcile_report(
+            report, report_error=None, inventory_updated_at=None, now=now,
+        )
+        future = monitor.enrich_reconcile_report(
+            report, report_error=None, inventory_updated_at="2026-10-18T13:00:00Z", now=now,
+        )
+        self.assertEqual(later["status"], "inventoried")
+        self.assertTrue(later["inventory_reflects_apply"])
+        for result in (same_or_older, missing, future):
+            with self.subTest(result=result):
+                self.assertEqual(result["status"], "awaiting_inventory")
+                self.assertFalse(result["inventory_reflects_apply"])
+
+    def test_blocked_actions_and_errors_override_complete_flag(self):
+        now = dt.datetime(2026, 10, 18, 12, tzinfo=dt.timezone.utc)
+        result = monitor.enrich_reconcile_report({
+            "mode": "apply", "updated_at": "2026-10-18T11:00:00Z", "complete": True,
+            "actions": [{"action_id": "a", "state": "blocked", "blocked": {"code": "target_conflict"}}],
+            "errors": [
+                {"action_id": "a", "code": "target_conflict", "message": "must not leak"},
+                {"message": "missing code still requires review"},
+            ],
+            "unresolved": [{"state": "blocked", "code": "unsafe_path"}],
+        }, report_error=None, inventory_updated_at="2026-10-18T11:01:00Z", now=now)
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["error_codes"], {"other": 1, "target_conflict": 1, "unsafe_path": 1})
+        self.assertEqual(result["unresolved_blocked_count"], 1)
+        self.assertFalse(result["inventory_reflects_apply"])
+
+    def test_dry_run_is_always_a_preview_and_malformed_report_is_unavailable(self):
+        now = dt.datetime(2026, 10, 18, 12, tzinfo=dt.timezone.utc)
+        preview = monitor.enrich_reconcile_report({
+            "mode": "dry-run", "updated_at": "2026-10-18T11:00:00Z", "complete": True,
+            "actions": [{"state": "planned"}], "errors": [], "unresolved": [],
+        }, report_error=None, inventory_updated_at="2026-10-18T11:01:00Z", now=now)
+        malformed = monitor.enrich_reconcile_report({
+            "mode": "apply", "updated_at": "2026-10-18T11:00:00Z", "actions": [{"state": []}],
+            "errors": [], "unresolved": [], "credential": "super-secret-value",
+        }, report_error=None, inventory_updated_at=None, now=now)
+        self.assertEqual(preview["status"], "preview")
+        self.assertIsNone(preview["inventory_reflects_apply"])
+        self.assertFalse(malformed["available"])
+        self.assertEqual(malformed["error"], "invalid_shape")
+        self.assertNotIn("super-secret-value", json.dumps(malformed))
+
+    def test_missing_or_corrupt_reconcile_report_does_not_fail_inventory_api(self):
+        self.write_inventory()
+        payload, status = monitor.build_api_data(
+            self.inventory_path, self.progress_path, self.failure_path,
+            reconcile_report_path=self.reconcile_report_path,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["reconciliation"]["error"], "not_found")
+
+        self.reconcile_report_path.write_text('{"mode":"apply",broken', encoding="utf-8")
+        payload, status = monitor.build_api_data(
+            self.inventory_path, self.progress_path, self.failure_path,
+            reconcile_report_path=self.reconcile_report_path,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["reconciliation"]["available"])
+        self.assertEqual(payload["reconciliation"]["error"], "unreadable_or_invalid")
+
+    def test_reconcile_ui_separates_report_from_inventory_snapshot(self):
+        html = self.index_path.read_text(encoding="utf-8")
+        self.assertIn('id="reconcileProgressSection" aria-label="云盘整理状态"', html)
+        self.assertIn('id="inventorySnapshotNotice"', html)
+        self.assertIn("目录树来自最近一次成功库存快照", html)
+        self.assertIn("Dry-run 仅是计划预览，没有执行云盘整理", html)
+        self.assertIn("存在阻塞项或错误，需核对", html)
+        self.assertNotIn("整理服务正在运行", html)
 
 
 if __name__ == "__main__":
