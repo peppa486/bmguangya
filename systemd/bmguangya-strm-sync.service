@@ -1,0 +1,29 @@
+[Unit]
+Description=Atomically reconcile local Jellyfin STRMs with the complete AList inventory
+After=network-online.target jellyfin-docker.service
+Wants=network-online.target
+Wants=jellyfin-docker.service
+ConditionPathExists=/etc/bmguangya/config.json
+ConditionPathExists=/var/lib/bmguangya/library.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+StateDirectory=bmguangya
+StateDirectoryMode=0750
+WorkingDirectory=/opt/bmguangya
+ExecStart=/opt/bmguangya/.venv/bin/python /opt/bmguangya/scripts/sync_library_strm.py --config /etc/bmguangya/config.json --inventory /var/lib/bmguangya/library.json --report /var/lib/bmguangya/strm-sync-report.json --apply
+TimeoutStartSec=25min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/opt/jellyfin/media/Anime /var/lib/bmguangya
+ReadOnlyPaths=/etc/bmguangya/config.json /opt/jellyfin/config/data/jellyfin.db

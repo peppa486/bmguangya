@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Bangumi × 光鸭媒体库</title>
+  <style>
+    :root{--bg:#0b0f19;--panel:#111827;--border:#263244;--text:#f3f6fb;--sub:#a3afc2;--muted:#728096;--blue:#60a5fa;--green:#34d399;--yellow:#fbbf24;--red:#fb7185;--hover:#1b2638}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;padding:22px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans CJK SC",sans-serif}.container{max-width:1380px;margin:0 auto}header{display:flex;justify-content:space-between;align-items:center;gap:18px;border-bottom:1px solid var(--border);padding:0 0 18px;margin-bottom:18px}.brand{display:flex;align-items:center;gap:13px}.mark{width:36px;height:36px;border-radius:10px;background:rgba(96,165,250,.15);color:var(--blue);display:grid;place-items:center;font-size:20px}.brand h1{font-size:21px;margin:0;letter-spacing:-.02em}.brand p{font-size:12px;color:var(--sub);margin:4px 0 0}.actions{display:flex;gap:9px;align-items:center}.search{width:min(330px,40vw);padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:13px;outline:none}.search:focus{border-color:var(--blue)}button{cursor:pointer;border:0;border-radius:9px;padding:10px 14px;background:#2563eb;color:white;font-weight:650}.button-secondary{border:1px solid var(--border);background:var(--panel);color:var(--sub)}.banner{padding:11px 14px;border:1px solid var(--border);border-radius:10px;margin-bottom:14px;background:var(--panel);font-size:13px;line-height:1.6}.banner.fresh{border-color:rgba(52,211,153,.45);color:var(--green)}.banner.stale,.banner.incomplete,.banner.unknown{border-color:rgba(251,191,36,.5);color:var(--yellow)}.banner.error{border-color:rgba(251,113,133,.5);color:var(--red)}.banner-detail{color:var(--sub);margin-top:3px}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.metric{display:flex;justify-content:space-between;align-items:center;padding:15px 17px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.metric-label{font-size:11px;color:var(--sub);letter-spacing:.07em}.metric-value{font-size:25px;font-weight:750;margin-top:5px}.metric-icon{width:42px;height:42px;border-radius:10px;display:grid;place-items:center;background:rgba(96,165,250,.12);color:var(--blue);font-size:19px}.progress{padding:13px 15px;border:1px solid var(--border);border-radius:12px;background:var(--panel);margin-bottom:15px}.progress-head{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--sub)}.progress-title{font-weight:700;color:var(--text)}.bar{height:7px;background:#202b3c;border-radius:9px;overflow:hidden;margin-top:10px}.bar-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#34d399);width:0}.tabs{display:flex;gap:7px;overflow:auto;border-bottom:1px solid var(--border);padding-bottom:9px;margin-bottom:13px}.tab{white-space:nowrap;border:1px solid transparent;background:transparent;color:var(--sub);padding:8px 12px;border-radius:8px}.tab:hover{background:var(--hover)}.tab.active{background:#2563eb;color:#fff}.tab span{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:10px;background:rgba(0,0,0,.24);font-size:11px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:11px;color:var(--sub);font-size:12px}.tree{border:1px solid var(--border);border-radius:13px;background:var(--panel);padding:10px}.show{border:1px solid transparent;border-radius:9px;margin:2px 0 6px}.show:hover{border-color:rgba(255,255,255,.05)}.show-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;background:rgba(255,255,255,.025);border-radius:8px}.show-main{min-width:0;display:flex;align-items:center;gap:9px}.show-name{font-size:14px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.show-path{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}.badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}.badge{padding:3px 8px;border-radius:6px;font-size:11px;white-space:nowrap;background:rgba(96,165,250,.12);color:var(--blue)}.badge.ok{background:rgba(52,211,153,.12);color:var(--green)}.badge.warn{background:rgba(251,191,36,.12);color:var(--yellow)}.badge.bad{background:rgba(251,113,133,.13);color:var(--red)}.show-body{padding:8px 13px 12px 35px;color:var(--sub);font-size:12px}.show-body[hidden]{display:none}.show-summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.show-summary strong{color:var(--text);font-weight:600}.missing-list{color:var(--yellow);line-height:1.6}.node{margin:3px 0 3px 12px}.node summary{cursor:pointer;line-height:1.8;color:var(--sub)}.node summary:hover{color:var(--text)}.node.file{margin-left:16px;list-style:none}.file-meta{color:var(--muted);font:11px ui-monospace,SFMono-Regular,Consolas,monospace;margin-left:7px}.empty{padding:42px;text-align:center;color:var(--muted)}.issues{margin:8px 0 0;padding-left:18px;color:var(--yellow)}.footer{padding:15px 2px;color:var(--muted);font-size:11px}.error-text{color:var(--red);white-space:pre-wrap;overflow-wrap:anywhere}@media(max-width:850px){body{padding:14px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}header{align-items:flex-start;flex-direction:column}.actions{width:100%}.search{width:100%;flex:1}.show-head{align-items:flex-start;flex-direction:column}.badges{justify-content:flex-start}.progress-head{flex-direction:column;gap:4px}}@media(max-width:480px){.metrics{grid-template-columns:1fr 1fr}.metric{padding:12px}.metric-value{font-size:21px}.brand h1{font-size:18px}.toolbar{align-items:flex-start;flex-direction:column}}
+    .metric-icon svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;fill:none}
+  </style>
+  <style>
+    .scan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:11px}
+    .scan-item{padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.02);font-size:12px;color:var(--sub)}
+    .scan-item strong{color:var(--text);font-weight:650}
+    .scan-list{margin:9px 0 0;padding-left:20px;font-size:12px;color:var(--sub);overflow-wrap:anywhere}
+    .scan-errors{margin-top:9px;color:var(--yellow);font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+    .scan-errors ul{margin:4px 0 0;padding-left:19px}
+    .scan-active{margin-top:9px;font-size:12px;color:var(--sub)}
+    .scan-active summary{cursor:pointer}
+    .reconcile-note{margin-top:10px;color:var(--sub);font-size:12px;line-height:1.6}
+    .reconcile-errors summary{cursor:pointer;color:var(--yellow)}
+    .reconcile-errors-note{margin:5px 0;color:var(--sub);font-size:11px}
+    .reconcile-progress.preview,.reconcile-progress.preview_needs_review{border-color:rgba(96,165,250,.5)}
+    .reconcile-progress.incomplete,.reconcile-progress.awaiting_inventory,.reconcile-progress.unavailable{border-color:rgba(251,191,36,.5)}
+    .reconcile-progress.needs_review{border-color:rgba(251,113,133,.55)}
+    .reconcile-progress.inventoried{border-color:rgba(52,211,153,.5)}
+    .snapshot-banner{color:var(--sub)}
+    .progress.stale{border-color:rgba(251,191,36,.5)}
+    .progress.incomplete{border-color:rgba(251,113,133,.5)}
+    .progress.complete{border-color:rgba(52,211,153,.45)}
+    @media(max-width:700px){.scan-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  </style>
+</head>
+<body>
+<main class="container">
+  <header>
+    <div class="brand"><div class="mark" aria-hidden="true">▤</div><div><h1>Bangumi × 光鸭媒体库</h1><p>云端目录实存、剧集覆盖与下载流水线状态</p></div></div>
+    <div class="actions"><input class="search" id="search" type="search" placeholder="搜索番名、文件名或路径" autocomplete="off"><button class="button-secondary" id="refresh">刷新数据</button></div>
+  </header>
+  <section id="freshness" class="banner unknown" role="status">正在读取库存状态…</section>
+  <section class="metrics" aria-label="库存统计">
+    <article class="metric"><div><div class="metric-label">BANGUMI 目标番数</div><div class="metric-value" id="targetCount">-</div></div><div class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 7v14"></path><path d="M3 18V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v13"></path><path d="M3 18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2"></path><path d="M7 7h2M7 11h2m6-4h2m-2 4h2"></path></svg></div></article>
+    <article class="metric"><div><div class="metric-label">云端实际目录（含嵌套）</div><div class="metric-value" id="cloudDirCount">-</div></div><div class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><path d="M3 10h18"></path></svg></div></article>
+    <article class="metric"><div><div class="metric-label">云端实际视频文件</div><div class="metric-value" id="videoCount">-</div></div><div class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M7 4v16m10-16v16M3 8h4m-4 4h4m-4 4h4m10-8h4m-4 4h4m-4 4h4"></path></svg></div></article>
+    <article class="metric"><div><div class="metric-label">已播且实际缺集</div><div class="metric-value" id="missingCount">-</div></div><div class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v4m0 4h.01"></path></svg></div></article>
+  </section>
+  <section class="progress" id="progressSection" aria-label="下载流水线进度" hidden>
+    <div class="progress-head"><span class="progress-title" id="progressTitle">下载进度：暂无状态</span><span id="progressMeta">-</span></div>
+    <div class="bar"><div class="bar-fill" id="progressBar"></div></div>
+  </section>
+  <section class="progress" id="inventoryProgressSection" aria-label="库存目录扫描进度" hidden>
+    <div class="progress-head"><span class="progress-title" id="inventoryProgressTitle">库存扫描：暂无状态</span><span id="inventoryProgressMeta">-</span></div>
+    <div class="scan-grid" id="inventoryProgressCounts"></div>
+    <details class="scan-active" id="inventoryActivePathsSection" hidden><summary>查看当前扫描目录</summary><ul class="scan-list" id="inventoryActivePaths"></ul></details>
+    <div class="scan-errors" id="inventoryProgressErrors" hidden></div>
+  </section>
+  <section class="progress reconcile-progress unavailable" id="reconcileProgressSection" aria-label="云盘整理状态">
+    <div class="progress-head"><span class="progress-title" id="reconcileProgressTitle">云盘整理：正在读取报告</span><span id="reconcileProgressMeta">-</span></div>
+    <div class="scan-grid" id="reconcileActionCounts"></div>
+    <div class="reconcile-note">库存待核对是计划中的未解决项，与本轮动作阻塞分开统计。</div>
+    <details class="scan-errors reconcile-errors" id="reconcileErrorDetails" hidden>
+      <summary id="reconcileErrorSummary">整理原因统计</summary>
+      <p class="reconcile-errors-note">原因记录可能与待核对项重叠，不代表不同事项的数量。</p>
+      <div id="reconcileErrorCodes"></div>
+    </details>
+    <div class="reconcile-note" id="reconcileSnapshotRelation">整理报告只读摘要；不会改变云盘。</div>
+  </section>
+  <section class="banner snapshot-banner" id="inventorySnapshotNotice" role="note">目录树展示最近一次完整库存快照，不代表实时云盘状态。</section>
+  <nav class="tabs" id="tabs" aria-label="Bangumi 分类"></nav>
+  <div class="toolbar"><span id="categorySummary">-</span><span id="resultCount"></span></div>
+  <section class="tree" id="tree" aria-live="polite"><div class="empty">读取中…</div></section>
+  <footer class="footer">此页面仅读取库存清单、目录扫描、下载流水线与整理报告摘要。缺集数使用库存中的实际差集，未知总集数不会推算为已完成。</footer>
+</main>
+<script>
+  const CATEGORIES=['在看','未标记','想看','看过'];
+  const RECONCILE_ERROR_LABELS={
+    unknown_episode_key:'集号未确认',unpaired_subtitle:'字幕未配对',
+    duplicate_content_variants:'同集存在不同版本',duplicate_content_unverified:'重复内容证据不足',
+    duplicate_content_target_conflict:'重复内容目标冲突',unmatched_extra:'额外文件未归类',
+    not_single_file:'多文件资源需核对',inconsistent_evidence:'剧集资源证据不一致',
+    duplicate_episode:'同一集存在重复匹配',
+    out_of_range_not_confident:'超出集号范围的元数据置信度不足',
+    out_of_range_evidence_invalid:'超范围集号或资源依据不完整',
+    duplicate_out_of_range_episode:'超范围集号重复',out_of_range_source_invalid:'超范围文件来源需核对',
+    out_of_range_tree_mismatch:'超范围目录与库存不一致',
+    out_of_range_subtitle_identity_missing:'超范围字幕无法确认归属',
+    out_of_range_target_conflict:'超范围整理目标冲突',
+    alist_auth:'文件服务认证失败',alist_http_error:'文件服务连接错误',
+    alist_request_uncertain:'文件服务请求响应未确认',alist_business_error:'文件服务业务响应异常',
+    alist_invalid_json:'光鸭服务响应格式错误',alist_invalid_list:'光鸭目录响应格式错误',
+    alist_truncated_list:'光鸭目录分页数据不完整',alist_unstable_pagination:'光鸭目录分页数据变化',
+    alist_pagination_limit:'光鸭目录分页超出安全限制',alist_invalid_name:'光鸭返回的文件名无效',
+    alist_duplicate_name:'光鸭返回了重复名称',
+    target_conflict:'目标已存在，拒绝覆盖',mkdir_target_conflict:'整理目录目标冲突',
+    rename_target_conflict:'重命名目标冲突',live_target_conflict:'云端目标已存在，拒绝覆盖',
+    live_source_mismatch:'云端源文件状态与库存不一致',move_not_verified:'云端移动结果未确认',
+    rename_not_verified:'云端重命名结果未确认',journal_pending:'前次操作仍待恢复核对',
+    journal_unreadable:'前次操作记录无法读取',unmatched_pending_journal:'前次待确认操作不在新计划中',
+    pending_action_not_in_new_plan:'前次待确认操作未纳入新计划',previous_pending_no_effect:'前次操作未生效，需复核',
+    completed_action_drifted:'已完成操作的云端状态发生变化',
+    ambiguous_unclaimed_directory:'未归属目录存在歧义',source_tree_mismatch:'源目录树与库存不一致',
+    missing_file_id:'文件标识缺失',missing_directory_id:'目录标识缺失',missing_subject_id:'Bangumi条目ID缺失',
+    show_not_confidently_matched:'Bangumi匹配依据不足',ambiguous_subject:'Bangumi条目匹配有歧义',
+    unmatched_subject:'Bangumi条目未匹配',duplicate_subject:'Bangumi条目重复',
+    show_directory_missing:'云端番剧目录缺失',episodes_missing:'Bangumi集数信息缺失',
+    unsafe_path:'路径不符合安全规则',directory_manifest_unreadable:'目录清单证据无法读取',
+    evidence_mismatch:'文件证据与库存不一致',unsupported_file:'文件类型不受支持',
+    inventory_incomplete:'库存扫描不完整',inventory_invalid:'库存内容无效',inventory_stale:'库存已过期',
+    root_mismatch:'云端根目录与库存不一致',missing_config:'必要配置缺失',invalid_config:'本地配置无效'
+  };
+  const $=id=>document.getElementById(id);
+  let data=null, progressSnapshot=null, inventoryProgressSnapshot=null, reconciliationSnapshot=null, unavailableMessage=null, activeCategory='在看', query='';
+  let refreshInFlight=false;
+  const REFRESH_TIMEOUT_MS=22000;
+  const expandedTreePaths=new Set();
+  const esc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const fmtTime=value=>{if(!value)return'未知';const date=new Date(value);return Number.isNaN(date.getTime())?String(value):new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'medium',timeStyle:'medium'}).format(date)};
+  const fmtDuration=value=>{if(!Number.isFinite(value)||value<0)return'未知';const seconds=Math.floor(value);const hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60),remaining=seconds%60;return hours?`${hours} 小时 ${minutes} 分钟`:minutes?`${minutes} 分 ${remaining} 秒`:`${remaining} 秒`};
+  const coverageKnown=show=>show.matched===true&&Array.isArray(show.missing_eps)&&(Number.isFinite(show.expected_eps_count)||Number.isFinite(show.total_eps));
+  const showMissing=show=>coverageKnown(show)?show.missing_eps.length:null;
+
+  function renderBanner(){
+    const box=$('freshness');
+    if(!data){box.className='banner error';box.textContent=unavailableMessage||'尚无可用的完整云盘清单，请稍后刷新';return;}
+    const freshness=data.freshness||{};
+    const state=freshness.state||'unknown';
+    box.className=`banner ${['fresh','stale','incomplete','unknown'].includes(state)?state:'unknown'}`;
+    const age=Number.isFinite(freshness.age_seconds)?`${Math.floor(freshness.age_seconds/60)} 分钟前`:'时间未知';
+    const ttl=Number.isFinite(freshness.ttl_seconds)?`${Math.floor(freshness.ttl_seconds/60)} 分钟有效期`:'';
+    const labels={fresh:'库存完整且新鲜',stale:'库存已过期',incomplete:'最近库存采集未完整',unknown:'库存新鲜度未知'};
+    const status=document.createElement('div');status.textContent=`${labels[state]||'库存状态未知'} · 最近成功采集 ${fmtTime(data.last_success_at||data.generated_at||data.updated_at)}（${age}，${ttl}）`;
+    box.replaceChildren(status);
+    const failure=data.latest_attempt;
+    const errors=(failure&&failure.errors)||(data.errors||[]);
+    if((failure&&failure.attempted_at)||errors.length){
+      const detail=document.createElement('div');detail.className='banner-detail';
+      const messages=Array.isArray(errors)?errors.map(e=>typeof e==='string'?e:(e.message||e.code||JSON.stringify(e))).join('；'):'';
+      detail.textContent=`最近采集尝试 ${fmtTime(failure&&failure.attempted_at)}${messages?`：${messages}`:''}`;
+      box.append(detail);
+    }
+  }
+
+  function renderProgress(){
+    const p=progressSnapshot;
+    $('progressSection').hidden=!p;
+    if(!p)return;
+    const status=String(p.status||'未知');
+    const current=Number(p.current_subject??p.current??0), total=Number(p.total_subjects??p.total??0);
+    const pct=total>0?Math.max(0,Math.min(100,current/total*100)):0;
+    const name=p.current_show||p.current_title||'';
+    $('progressTitle').textContent=`下载进度：${status}${name?` · ${name}`:''}`;
+    $('progressMeta').textContent=`番剧 ${current}/${total} · 已提交 ${Number(p.submitted_count||0)} · 更新 ${fmtTime(p.updated_at)}`;
+    $('progressBar').style.width=`${pct}%`;
+  }
+
+  function renderInventoryProgress(){
+    const section=$('inventoryProgressSection');
+    const p=inventoryProgressSnapshot;
+    section.hidden=!p;
+    if(!p)return;
+    const status=String(p.status||'unknown');
+    const labels={running:'正在扫描',stale:'扫描心跳已超时',complete:'扫描完成',incomplete:'扫描未完整',unknown:'扫描状态未知'};
+    section.className=`progress ${['running','stale','complete','incomplete'].includes(status)?status:''}`;
+    $('inventoryProgressTitle').textContent=`库存扫描：${labels[status]||labels.unknown}${p.phase?` · ${p.phase}`:''}`;
+    const age=Number.isFinite(p.heartbeat_age_seconds)?`心跳 ${p.heartbeat_age_seconds} 秒前`:'心跳时间未知';
+    $('inventoryProgressMeta').textContent=`耗时 ${fmtDuration(p.elapsed_seconds)} · ${age} · 更新 ${fmtTime(p.updated_at)}`;
+    const count=(key)=>Number.isInteger(p[key])?p[key]:'未知';
+    const rows=[
+      ['目录已发现',count('directories_discovered')],['目录已开始',count('directories_started')],
+      ['目录已完成',count('directories_completed')],['目录成功',count('directories_succeeded')],
+      ['目录失败',count('directories_failed')],['待处理目录',count('directories_pending')],
+      ['已见文件',count('files_seen')]
+    ];
+    $('inventoryProgressCounts').innerHTML=rows.map(([label,value])=>`<div class="scan-item">${esc(label)}：<strong>${esc(value)}</strong></div>`).join('');
+    const paths=Array.isArray(p.active_paths)?p.active_paths:[];
+    const pathSection=$('inventoryActivePathsSection');
+    pathSection.hidden=!paths.length;
+    $('inventoryActivePaths').innerHTML=paths.map(path=>`<li>${esc(path)}</li>`).join('');
+    const counts=p.error_counts&&typeof p.error_counts==='object'?Object.entries(p.error_counts):[];
+    const errors=Array.isArray(p.recent_errors)?p.recent_errors:[];
+    const errorBox=$('inventoryProgressErrors');
+    errorBox.hidden=!counts.length&&!errors.length;
+    const countText=counts.map(([key,value])=>`${esc(key)} ${Number.isInteger(value)?value:'?'}`).join(' · ');
+    const errorRows=errors.map(item=>{
+      if(typeof item==='string')return `<li>${esc(item)}</li>`;
+      if(!item||typeof item!=='object')return '';
+      const text=[item.code,item.phase,item.message,item.path].filter(Boolean).map(esc).join(' · ');
+      return text?`<li>${text}</li>`:'';
+    }).filter(Boolean).join('');
+    errorBox.innerHTML=`${countText?`错误统计：${countText}`:''}${errorRows?`<ul>${errorRows}</ul>`:''}`;
+  }
+
+  function renderReconciliation(){
+    const section=$('reconcileProgressSection');
+    const report=reconciliationSnapshot;
+    const status=report&&report.available?String(report.status||'unavailable'):'unavailable';
+    const labels={
+      unavailable:'整理报告不可用',preview:'Dry-run 预览（未执行）',
+      preview_needs_review:'Dry-run 预览 · 存在需核对项',incomplete:'报告仍有未完成动作',
+      needs_review:'存在阻塞项或错误，需核对',awaiting_inventory:'动作已完成，等待整理后重扫',
+      inventoried:'整理后已重新盘点'
+    };
+    const allowed=['unavailable','preview','preview_needs_review','incomplete','needs_review','awaiting_inventory','inventoried'];
+    section.className=`progress reconcile-progress ${allowed.includes(status)?status:'unavailable'}`;
+    $('reconcileProgressTitle').textContent=`云盘整理：${labels[status]||labels.unavailable}`;
+    const mode=report&&report.mode==='apply'?'apply':report&&report.mode==='dry-run'?'dry-run':null;
+    $('reconcileProgressMeta').textContent=report&&report.available
+      ?`${mode||'模式未知'} 报告 · 更新 ${fmtTime(report.updated_at)}`
+      :`报告不可用 · ${report&&report.error==='not_found'?'尚无报告':report&&report.error==='unreadable_or_invalid'?'文件无法读取或格式损坏':'报告结构未知'}`;
+    const counts=report&&report.available&&report.action_counts?report.action_counts:null;
+    const count=key=>counts&&Number.isInteger(counts[key])?counts[key]:'—';
+    const unresolved=report&&report.available&&Number.isInteger(report.unresolved_blocked_count)&&report.unresolved_blocked_count>=0?report.unresolved_blocked_count:'—';
+    const rows=[['计划',count('planned')],['待确认',count('pending')],['完成',count('done')],['阻塞',count('blocked')],['无需操作',count('noop')],['库存待核对',unresolved]];
+    $('reconcileActionCounts').innerHTML=rows.map(([label,value])=>`<div class="scan-item">${esc(label)}：<strong>${esc(value)}</strong></div>`).join('');
+    const errorCodes=report&&report.available&&report.error_codes&&typeof report.error_codes==='object'?Object.entries(report.error_codes):[];
+    const reasonTotals=new Map();
+    errorCodes.forEach(([code,value])=>{
+      if(!Number.isInteger(value)||value<0)return;
+      const label=Object.prototype.hasOwnProperty.call(RECONCILE_ERROR_LABELS,code)?RECONCILE_ERROR_LABELS[code]:'其他需核对原因';
+      reasonTotals.set(label,(reasonTotals.get(label)||0)+value);
+    });
+    const reasonTotal=[...reasonTotals.values()].reduce((sum,value)=>sum+value,0);
+    const reasonDetails=$('reconcileErrorDetails');
+    reasonDetails.hidden=!reasonTotals.size;
+    $('reconcileErrorSummary').textContent=`原因统计：${reasonTotal} 条记录（展开分类）`;
+    const errorBox=$('reconcileErrorCodes');
+    const reasonList=document.createElement('ul');
+    [...reasonTotals.entries()].sort((left,right)=>left[0].localeCompare(right[0],'zh-CN')).forEach(([label,value])=>{
+      const item=document.createElement('li');item.textContent=`${label}：${value}`;reasonList.append(item);
+    });
+    errorBox.replaceChildren(reasonList);
+    const relation=$('reconcileSnapshotRelation');
+    if(!report||!report.available){
+      relation.textContent='整理报告不可用；不能据此判断整理结果。下方目录树只代表最近一次库存快照。';
+    }else if(report.mode==='dry-run'){
+      relation.textContent='Dry-run 仅是计划预览，没有执行云盘整理；目录树仍来自最近库存快照。';
+    }else if(report.inventory_reflects_apply===true){
+      relation.textContent=`库存快照 ${fmtTime(report.inventory_snapshot_at)} 晚于整理报告，且没有未完成或需核对的动作。`;
+    }else if(report.status==='needs_review'){
+      relation.textContent='整理报告有阻塞项或错误；即使目录树较新，也不能视为整理已全部完成。';
+    }else if(report.status==='incomplete'){
+      relation.textContent='整理报告尚未完整结束，可能仍有计划中或待确认的动作；目录树可能未反映整理结果。';
+    }else{
+      relation.textContent=`目录树来自库存快照 ${fmtTime(report.inventory_snapshot_at)}；尚无晚于整理报告的完整重扫，当前树可能未反映整理结果。`;
+    }
+  }
+
+  function renderInventorySnapshotNotice(){
+    const notice=$('inventorySnapshotNotice');
+    notice.textContent=data
+      ?`目录树来自最近一次成功库存快照：${fmtTime(data.generated_at||data.updated_at)}。这不是实时云端视图。`
+      :'当前没有可展示的完整库存快照；整理报告状态独立显示，不代表库存可用。';
+  }
+
+  function renderMetrics(){
+    if(!data){for(const id of ['targetCount','cloudDirCount','videoCount','missingCount'])$(id).textContent='-';return;}
+    const stats=data.stats||{};
+    $('targetCount').textContent=stats.bangumi_target_shows??(data.counts||{}).bangumi_targets??'-';
+    $('cloudDirCount').textContent=stats.cloud_directories??(data.counts||{}).cloud_directories??'-';
+    $('videoCount').textContent=stats.total_vids??(data.counts||{}).cloud_video_files??'-';
+    $('missingCount').textContent=stats.missing_episodes??(data.counts||{}).missing_episodes??'-';
+  }
+
+  function renderTabs(){
+    if(!data){$('tabs').innerHTML=CATEGORIES.map(name=>`<button class="tab ${activeCategory===name?'active':''}" data-category="${esc(name)}">${esc(name)} <span>目标 - · 实存目录 -</span></button>`).join('');return;}
+    const categories=data.tree||[];
+    $('tabs').innerHTML=CATEGORIES.map(name=>{
+      const section=categories.find(item=>item.category===name);
+      const stats=(data.stats&&data.stats.categories&&data.stats.categories[name])||{};
+      const dirs=stats.cloud_directories??((section&&section.shows)||[]).filter(show=>show.source_path).length;
+      const targets=stats.bangumi_targets??((section&&section.shows)||[]).filter(show=>show.subject_id).length;
+      return `<button class="tab ${activeCategory===name?'active':''}" data-category="${esc(name)}">${esc(name)} <span>目标 ${targets} · 实存目录 ${dirs}</span></button>`;
+    }).join('');
+  }
+
+  function captureTreeExpansion(){
+    document.querySelectorAll('#tree details[data-expand-key]').forEach(details=>{
+      const key=details.dataset.expandKey;
+      if(!key)return;
+      if(details.open)expandedTreePaths.add(key);else expandedTreePaths.delete(key);
+    });
+  }
+  function restoreTreeExpansion(container){
+    container.querySelectorAll('details[data-expand-key]').forEach(details=>{
+      details.open=expandedTreePaths.has(details.dataset.expandKey);
+    });
+  }
+  function renderNode(node, depth=0, parentPath=''){
+    if(depth>12)return'';
+    const name=esc(node.name||node.path||'未命名节点');
+    if(node.type==='directory'){
+      const children=Array.isArray(node.children)?node.children:[];
+      const label=`${name} · ${children.length} 项`;
+      const path=typeof node.path==='string'&&node.path?node.path:[parentPath,String(node.name||'')].filter(Boolean).join('/');
+      return `<details class="node" data-expand-key="${esc(`node:${path}`)}"><summary>${label}</summary>${children.map(child=>renderNode(child,depth+1,path)).join('')}</details>`;
+    }
+    const size=Number.isFinite(node.size)?`${(node.size/1024/1024).toFixed(1)} MB`:'';
+    const modified=node.modified?fmtTime(node.modified):'';
+    return `<div class="node file">${name}<span class="file-meta">${esc(size)}${size&&modified?' · ':''}${esc(modified)}</span></div>`;
+  }
+
+  function renderTree(){
+    captureTreeExpansion();
+    if(!data){$('categorySummary').textContent='-';$('resultCount').textContent='';$('tree').innerHTML='<div class="empty">当前没有可展示的完整清单</div>';return;}
+    const section=(data.tree||[]).find(item=>item.category===activeCategory);
+    const container=$('tree');
+    if(!section){container.innerHTML='<div class="empty">没有该分类的数据</div>';return;}
+    let shows=Array.isArray(section.shows)?section.shows:[];
+    if(query){const q=query.toLocaleLowerCase();shows=shows.filter(show=>JSON.stringify(show).toLocaleLowerCase().includes(q));}
+    $('categorySummary').textContent=`Bangumi 目标 ${((data.stats||{}).categories||{})[activeCategory]?.bangumi_targets??shows.filter(s=>s.subject_id).length} 部 · 云端实存目录 ${((data.stats||{}).categories||{})[activeCategory]?.cloud_directories??shows.filter(s=>s.source_path).length} 个`;
+    $('resultCount').textContent=`显示 ${shows.length} 部`;
+    if(!shows.length){container.innerHTML='<div class="empty">没有匹配的番剧</div>';return;}
+    container.innerHTML=shows.map((show,index)=>{
+      const count=Number(show.count??(show.vids||[]).length);
+      const missing=showMissing(show);
+      const hasCloud=Boolean(show.source_path);
+      const hasTarget=Boolean(show.subject_id);
+      const total=show.total_eps;
+      const badges=[`<span class="badge ${hasCloud?'ok':'warn'}">${hasCloud?`云端实存 ${count} 个视频`:'云端目录未匹配'}</span>`];
+      if(hasTarget)badges.push('<span class="badge">Bangumi 目标</span>');
+      if(show.matched===true)badges.push('<span class="badge ok">匹配唯一</span>');
+      if(show.ambiguous)badges.push('<span class="badge bad">匹配有歧义</span>');
+      if(show.unmatched)badges.push('<span class="badge warn">无 Bangumi 匹配</span>');
+      if(show.coverage_unknown)badges.push('<span class="badge warn">Bangumi 集数映射未知</span>');
+      if(hasTarget&&show.matched===true)badges.push(`<span class="badge ${missing===null?'warn':missing?'bad':'ok'}">${missing===null?'缺集未判定':`已播缺集 ${missing}`}</span>`);
+      const expected=Number.isFinite(total)?`Bangumi 总集数 ${total}`:'Bangumi 总集数未知';
+      const missingList=Array.isArray(show.missing_eps)&&show.missing_eps.length?`<div class="missing-list">实存差集：${show.missing_eps.map(esc).join('、')}</div>`:'';
+      const issues=[];
+      (show.duplicate_eps||[]).forEach(ep=>issues.push(`重复匹配剧集 ${ep}`));
+      (show.extra_eps||[]).forEach(ep=>issues.push(`未归入 Bangumi 剧集：${ep.name||ep.file_name||ep}`));
+      (show.coverage_issues||[]).forEach(issue=>issues.push(issue.message||issue.code||'Bangumi 集数映射需核查'));
+      (show.episodes||[]).filter(ep=>ep.coverage_unknown).forEach(ep=>issues.push(`Bangumi 集数无法确定：${ep.name||ep.episode_key||ep.episode_id||'未知条目'}`));
+      const issueHtml=issues.length?`<ul class="issues">${issues.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`:'';
+      const children=Array.isArray(show.children)?show.children:[];
+      const showPath=String(show.source_path||show.path||`subject:${show.subject_id||show.name||show.cloud_name||index}`);
+      const nodes=children.map(node=>renderNode(node,0,showPath)).join('');
+      return `<article class="show"><div class="show-head"><div class="show-main"><span aria-hidden="true">▸</span><div style="min-width:0"><div class="show-name">${esc(show.name||show.cloud_name||'未命名番剧')}</div><div class="show-path">${hasCloud?esc(show.source_path):'尚无已匹配的云端目录'}${show.subject_id?` · Bangumi ID ${esc(show.subject_id)}`:''}</div></div></div><div class="badges">${badges.join('')}</div></div><div class="show-body"><div class="show-summary"><strong>云端视频 ${count}</strong><span>${esc(expected)}</span><span>${missing===null?'缺集未判定':`已播缺集 ${missing}`}</span><span>嵌套目录 ${(show.dirs||[]).length}</span></div>${missingList}${issueHtml}${children.length?`<details data-expand-key="${esc(`show:${showPath}`)}"><summary>查看真实云端目录树（${children.length} 项）</summary>${nodes}</details>`:(show.vids||[]).map(v=>`<div class="node file">${esc(v.name)}</div>`).join('')||'<div>暂无云端文件</div>'}</div></article>`;
+    }).join('');
+    restoreTreeExpansion(container);
+  }
+
+  function render(){renderBanner();renderMetrics();renderProgress();renderInventoryProgress();renderReconciliation();renderInventorySnapshotNotice();renderTabs();renderTree();}
+  function unavailableCopy(result,status){
+    if(result&&result.error==='inventory_unavailable'){
+      if(result.inventory_error==='invalid_shape'||result.inventory_error==='invalid_json')return'云盘清单暂时无法读取，请稍后刷新';
+      return'尚无可用的完整云盘清单，请稍后刷新';
+    }
+    if(status===503)return'尚无可用的完整云盘清单，请稍后刷新';
+    return'暂时无法读取云盘清单，请稍后刷新';
+  }
+  async function refresh(){
+    if(refreshInFlight)return;
+    refreshInFlight=true;
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),REFRESH_TIMEOUT_MS);
+    $('refresh').disabled=true;$('refresh').textContent='读取中…';
+    let responseStatus=0,result=null;
+    try{
+      const response=await fetch(`/api/data?t=${Date.now()}`,{cache:'no-store',credentials:'same-origin',signal:controller.signal});
+      responseStatus=response.status;
+      result=await response.json();
+      if(!response.ok||result.error==='inventory_unavailable')throw new Error('unavailable');
+      data=result;progressSnapshot=result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;reconciliationSnapshot=result.reconciliation&&typeof result.reconciliation==='object'?result.reconciliation:null;unavailableMessage=null;render();
+    }catch(error){data=null;unavailableMessage=unavailableCopy(result,responseStatus);progressSnapshot=result&&result.progress&&typeof result.progress==='object'?result.progress:null;inventoryProgressSnapshot=result&&result.inventory_progress&&typeof result.inventory_progress==='object'?result.inventory_progress:null;reconciliationSnapshot=result&&result.reconciliation&&typeof result.reconciliation==='object'?result.reconciliation:null;render();}
+    finally{clearTimeout(timeout);refreshInFlight=false;$('refresh').disabled=false;$('refresh').textContent='刷新数据';}
+  }
+  $('tree').addEventListener('toggle',event=>{
+    const details=event.target;
+    if(!details||details.tagName!=='DETAILS'||!details.dataset.expandKey)return;
+    if(details.open)expandedTreePaths.add(details.dataset.expandKey);else expandedTreePaths.delete(details.dataset.expandKey);
+  },true);
+  $('tabs').addEventListener('click',event=>{const button=event.target.closest('[data-category]');if(!button)return;activeCategory=button.dataset.category;renderTabs();renderTree();});
+  $('search').addEventListener('input',event=>{query=event.target.value.trim();renderTree();});
+  $('refresh').addEventListener('click',refresh);
+  refresh();setInterval(refresh,15000);
+</script>
+</body>
+</html>

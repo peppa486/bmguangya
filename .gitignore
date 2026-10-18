@@ -1,6 +1,7 @@
 # 配置文件（包含敏感信息）
 config/*.json
 !config/*.example.json
+!config/runtime.example.json
 
 # 状态文件和日志
 state/
@@ -24,3 +25,6 @@ __pycache__/
 # 临时文件
 *.tmp
 *.bak
+
+# Local development and verification artifacts
+/work/
