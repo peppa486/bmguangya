@@ -20,6 +20,8 @@
     .scan-active{margin-top:9px;font-size:12px;color:var(--sub)}
     .scan-active summary{cursor:pointer}
     .reconcile-note{margin-top:10px;color:var(--sub);font-size:12px;line-height:1.6}
+    .reconcile-errors summary{cursor:pointer;color:var(--yellow)}
+    .reconcile-errors-note{margin:5px 0;color:var(--sub);font-size:11px}
     .reconcile-progress.preview,.reconcile-progress.preview_needs_review{border-color:rgba(96,165,250,.5)}
     .reconcile-progress.incomplete,.reconcile-progress.awaiting_inventory,.reconcile-progress.unavailable{border-color:rgba(251,191,36,.5)}
     .reconcile-progress.needs_review{border-color:rgba(251,113,133,.55)}
@@ -57,7 +59,12 @@
   <section class="progress reconcile-progress unavailable" id="reconcileProgressSection" aria-label="云盘整理状态">
     <div class="progress-head"><span class="progress-title" id="reconcileProgressTitle">云盘整理：正在读取报告</span><span id="reconcileProgressMeta">-</span></div>
     <div class="scan-grid" id="reconcileActionCounts"></div>
-    <div class="scan-errors" id="reconcileErrorCodes" hidden></div>
+    <div class="reconcile-note">库存待核对是计划中的未解决项，与本轮动作阻塞分开统计。</div>
+    <details class="scan-errors reconcile-errors" id="reconcileErrorDetails" hidden>
+      <summary id="reconcileErrorSummary">整理原因统计</summary>
+      <p class="reconcile-errors-note">原因记录可能与待核对项重叠，不代表不同事项的数量。</p>
+      <div id="reconcileErrorCodes"></div>
+    </details>
     <div class="reconcile-note" id="reconcileSnapshotRelation">整理报告只读摘要；不会改变云盘。</div>
   </section>
   <section class="banner snapshot-banner" id="inventorySnapshotNotice" role="note">目录树展示最近一次完整库存快照，不代表实时云盘状态。</section>
@@ -68,6 +75,41 @@
 </main>
 <script>
   const CATEGORIES=['在看','未标记','想看','看过'];
+  const RECONCILE_ERROR_LABELS={
+    unknown_episode_key:'集号未确认',unpaired_subtitle:'字幕未配对',
+    duplicate_content_variants:'同集存在不同版本',duplicate_content_unverified:'重复内容证据不足',
+    duplicate_content_target_conflict:'重复内容目标冲突',unmatched_extra:'额外文件未归类',
+    not_single_file:'多文件资源需核对',inconsistent_evidence:'剧集资源证据不一致',
+    duplicate_episode:'同一集存在重复匹配',
+    out_of_range_not_confident:'超出集号范围的元数据置信度不足',
+    out_of_range_evidence_invalid:'超范围集号或资源依据不完整',
+    duplicate_out_of_range_episode:'超范围集号重复',out_of_range_source_invalid:'超范围文件来源需核对',
+    out_of_range_tree_mismatch:'超范围目录与库存不一致',
+    out_of_range_subtitle_identity_missing:'超范围字幕无法确认归属',
+    out_of_range_target_conflict:'超范围整理目标冲突',
+    alist_auth:'文件服务认证失败',alist_http_error:'文件服务连接错误',
+    alist_request_uncertain:'文件服务请求响应未确认',alist_business_error:'文件服务业务响应异常',
+    alist_invalid_json:'光鸭服务响应格式错误',alist_invalid_list:'光鸭目录响应格式错误',
+    alist_truncated_list:'光鸭目录分页数据不完整',alist_unstable_pagination:'光鸭目录分页数据变化',
+    alist_pagination_limit:'光鸭目录分页超出安全限制',alist_invalid_name:'光鸭返回的文件名无效',
+    alist_duplicate_name:'光鸭返回了重复名称',
+    target_conflict:'目标已存在，拒绝覆盖',mkdir_target_conflict:'整理目录目标冲突',
+    rename_target_conflict:'重命名目标冲突',live_target_conflict:'云端目标已存在，拒绝覆盖',
+    live_source_mismatch:'云端源文件状态与库存不一致',move_not_verified:'云端移动结果未确认',
+    rename_not_verified:'云端重命名结果未确认',journal_pending:'前次操作仍待恢复核对',
+    journal_unreadable:'前次操作记录无法读取',unmatched_pending_journal:'前次待确认操作不在新计划中',
+    pending_action_not_in_new_plan:'前次待确认操作未纳入新计划',previous_pending_no_effect:'前次操作未生效，需复核',
+    completed_action_drifted:'已完成操作的云端状态发生变化',
+    ambiguous_unclaimed_directory:'未归属目录存在歧义',source_tree_mismatch:'源目录树与库存不一致',
+    missing_file_id:'文件标识缺失',missing_directory_id:'目录标识缺失',missing_subject_id:'Bangumi条目ID缺失',
+    show_not_confidently_matched:'Bangumi匹配依据不足',ambiguous_subject:'Bangumi条目匹配有歧义',
+    unmatched_subject:'Bangumi条目未匹配',duplicate_subject:'Bangumi条目重复',
+    show_directory_missing:'云端番剧目录缺失',episodes_missing:'Bangumi集数信息缺失',
+    unsafe_path:'路径不符合安全规则',directory_manifest_unreadable:'目录清单证据无法读取',
+    evidence_mismatch:'文件证据与库存不一致',unsupported_file:'文件类型不受支持',
+    inventory_incomplete:'库存扫描不完整',inventory_invalid:'库存内容无效',inventory_stale:'库存已过期',
+    root_mismatch:'云端根目录与库存不一致',missing_config:'必要配置缺失',invalid_config:'本地配置无效'
+  };
   const $=id=>document.getElementById(id);
   let data=null, progressSnapshot=null, inventoryProgressSnapshot=null, reconciliationSnapshot=null, unavailableMessage=null, activeCategory='在看', query='';
   let refreshInFlight=false;
@@ -169,12 +211,26 @@
       :`报告不可用 · ${report&&report.error==='not_found'?'尚无报告':report&&report.error==='unreadable_or_invalid'?'文件无法读取或格式损坏':'报告结构未知'}`;
     const counts=report&&report.available&&report.action_counts?report.action_counts:null;
     const count=key=>counts&&Number.isInteger(counts[key])?counts[key]:'—';
-    const rows=[['计划',count('planned')],['待确认',count('pending')],['完成',count('done')],['阻塞',count('blocked')],['无需操作',count('noop')]];
+    const unresolved=report&&report.available&&Number.isInteger(report.unresolved_blocked_count)&&report.unresolved_blocked_count>=0?report.unresolved_blocked_count:'—';
+    const rows=[['计划',count('planned')],['待确认',count('pending')],['完成',count('done')],['阻塞',count('blocked')],['无需操作',count('noop')],['库存待核对',unresolved]];
     $('reconcileActionCounts').innerHTML=rows.map(([label,value])=>`<div class="scan-item">${esc(label)}：<strong>${esc(value)}</strong></div>`).join('');
     const errorCodes=report&&report.available&&report.error_codes&&typeof report.error_codes==='object'?Object.entries(report.error_codes):[];
+    const reasonTotals=new Map();
+    errorCodes.forEach(([code,value])=>{
+      if(!Number.isInteger(value)||value<0)return;
+      const label=Object.prototype.hasOwnProperty.call(RECONCILE_ERROR_LABELS,code)?RECONCILE_ERROR_LABELS[code]:'其他需核对原因';
+      reasonTotals.set(label,(reasonTotals.get(label)||0)+value);
+    });
+    const reasonTotal=[...reasonTotals.values()].reduce((sum,value)=>sum+value,0);
+    const reasonDetails=$('reconcileErrorDetails');
+    reasonDetails.hidden=!reasonTotals.size;
+    $('reconcileErrorSummary').textContent=`原因统计：${reasonTotal} 条记录（展开分类）`;
     const errorBox=$('reconcileErrorCodes');
-    errorBox.hidden=!errorCodes.length;
-    errorBox.textContent=errorCodes.length?'错误码：'+errorCodes.map(([code,value])=>`${code} × ${value}`).join(' · '):'';
+    const reasonList=document.createElement('ul');
+    [...reasonTotals.entries()].sort((left,right)=>left[0].localeCompare(right[0],'zh-CN')).forEach(([label,value])=>{
+      const item=document.createElement('li');item.textContent=`${label}：${value}`;reasonList.append(item);
+    });
+    errorBox.replaceChildren(reasonList);
     const relation=$('reconcileSnapshotRelation');
     if(!report||!report.available){
       relation.textContent='整理报告不可用；不能据此判断整理结果。下方目录树只代表最近一次库存快照。';

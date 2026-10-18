@@ -2153,10 +2153,49 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
 
 
 class AListClient:
+    READONLY_MAX_ATTEMPTS = 3
+    RETRYABLE_BUSINESS_CODES = {"500", "502", "503", "504"}
+    TRANSIENT_BUSINESS_MESSAGES = (
+        "timeout", "timed out", "deadline exceeded", "temporarily unavailable",
+    )
+    PERMANENT_BUSINESS_MESSAGES = (
+        "denied", "permission", "authentication", "authorization", "unauthorized",
+        "forbidden", "credential", "token",
+    )
+
     def __init__(self, cfg: dict, *, session: Optional[requests.Session] = None):
         self.cfg = cfg["alist"]
         self.session = session or requests.Session()
         self.token = self.cfg["token"]
+
+    @classmethod
+    def _retryable_list_error(cls, exc: ReconcileError) -> bool:
+        if exc.details.get("stage") == "alist_auth":
+            return False
+        if exc.code == "alist_request_uncertain":
+            return exc.details.get("retryable_transport") is True
+        http_status = exc.details.get("http_status")
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            return http_status == 429 or 500 <= http_status <= 599
+        if exc.code != "alist_business_error":
+            return False
+        business_code = str(exc.details.get("business_code", ""))
+        if business_code not in cls.RETRYABLE_BUSINESS_CODES:
+            return False
+        message = str(exc.details.get("business_message", "")).casefold()
+        if (any(marker in message for marker in cls.PERMANENT_BUSINESS_MESSAGES)
+                or re.search(r"\bauth\b", message)):
+            return False
+        return any(marker in message for marker in cls.TRANSIENT_BUSINESS_MESSAGES)
+
+    def _list_page(self, body: dict) -> dict:
+        for attempt in range(self.READONLY_MAX_ATTEMPTS):
+            try:
+                return self._post("/api/fs/list", body, stage="list")
+            except ReconcileError as exc:
+                if attempt + 1 >= self.READONLY_MAX_ATTEMPTS or not self._retryable_list_error(exc):
+                    raise
+        raise AssertionError("bounded list retry loop exhausted without a result")
 
     def _post(self, endpoint: str, body: dict, *, stage: str) -> dict:
         if not self.token:
@@ -2178,7 +2217,9 @@ class AListClient:
                                          timeout=self.cfg["timeout_seconds"])
         except requests.RequestException as exc:
             raise ReconcileError("AList {} request failed before confirmation: {}".format(stage, exc),
-                                 code="alist_request_uncertain") from exc
+                                 code="alist_request_uncertain",
+                                 details={"retryable_transport": isinstance(
+                                     exc, (requests.Timeout, requests.ConnectionError))}) from exc
         return self._decode(response, stage=stage)
 
     @staticmethod
@@ -2186,7 +2227,10 @@ class AListClient:
         try:
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise ReconcileError("AList {} HTTP request failed: {}".format(stage, exc), code="alist_http_error") from exc
+            status = getattr(response, "status_code", None)
+            details = {"http_status": status, "stage": stage} if isinstance(status, int) else {"stage": stage}
+            raise ReconcileError("AList {} HTTP request failed: {}".format(stage, exc),
+                                 code="alist_http_error", details=details) from exc
         try:
             payload = response.json()
         except ValueError as exc:
@@ -2195,7 +2239,9 @@ class AListClient:
             code = payload.get("code") if isinstance(payload, dict) else None
             message = payload.get("message") if isinstance(payload, dict) else "invalid response"
             raise ReconcileError("AList {} business code was not 200: {} {}".format(stage, code, message),
-                                 code="alist_business_error", details={"business_code": code})
+                                 code="alist_business_error",
+                                 details={"business_code": code, "stage": stage,
+                                          "business_message": message if isinstance(message, str) else ""})
         return payload
 
     def list_all(self, path: str, *, refresh: bool = True) -> List[dict]:
@@ -2203,9 +2249,9 @@ class AListClient:
         page = 1
         total: Optional[int] = None
         while True:
-            payload = self._post("/api/fs/list", {"path": path, "password": "", "page": page,
-                                                  "per_page": self.cfg["page_size"], "refresh": bool(refresh and page == 1)},
-                                 stage="list")
+            payload = self._list_page({"path": path, "password": "", "page": page,
+                                       "per_page": self.cfg["page_size"],
+                                       "refresh": bool(refresh and page == 1)})
             data = payload.get("data")
             if not isinstance(data, dict):
                 raise ReconcileError("AList list response has no content list", code="alist_invalid_list")

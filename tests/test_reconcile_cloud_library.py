@@ -1588,11 +1588,12 @@ class ReconcileExecutionTests(unittest.TestCase):
 
 class AListClientTests(unittest.TestCase):
     class Response:
-        status_code = 200
-        def __init__(self, payload):
+        def __init__(self, payload, status_code=200):
             self.payload = payload
+            self.status_code = status_code
         def raise_for_status(self):
-            return None
+            if self.status_code >= 400:
+                raise rec.requests.HTTPError("HTTP {}".format(self.status_code))
         def json(self):
             return self.payload
 
@@ -1602,7 +1603,12 @@ class AListClientTests(unittest.TestCase):
             self.calls = []
         def post(self, url, **kwargs):
             self.calls.append((url, kwargs))
-            return AListClientTests.Response(self.payloads.pop(0))
+            result = self.payloads.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], int):
+                return AListClientTests.Response(result[1], status_code=result[0])
+            return AListClientTests.Response(result)
 
     def test_list_all_pages_and_business_code_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1620,6 +1626,84 @@ class AListClientTests(unittest.TestCase):
             bad = self.Session([{"code": 500, "message": "denied"}])
             with self.assertRaisesRegex(rec.ReconcileError, "business code was not 200"):
                 rec.AListClient(cfg, session=bad).list_all(ROOT)
+            self.assertEqual(len(bad.calls), 1)
+
+    def test_list_all_retries_transient_network_and_business_failures(self):
+        success = {"code": 200, "data": {"total": 1, "content": [fnode("a.mkv", "a")]}}
+        cases = (
+            ([rec.requests.ReadTimeout("read timed out"), success], 2),
+            ([{"code": 500, "message": "upstream temporarily unavailable"}, success], 2),
+            ([{"code": 503, "message": "upstream deadline exceeded"}, success], 2),
+            ([(429, {"code": 429, "message": "rate limited"}), success], 2),
+        )
+        for payloads, expected_calls in cases:
+            with self.subTest(payloads=payloads), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(tmp)
+                session = self.Session(payloads)
+
+                rows = rec.AListClient(cfg, session=session).list_all(ROOT, refresh=True)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(session.calls), expected_calls)
+            self.assertTrue(all(call[1]["json"]["refresh"] is True for call in session.calls))
+
+    def test_list_all_retry_budget_is_bounded_and_auth_or_shape_errors_are_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config(tmp)
+            exhausted = self.Session([rec.requests.ReadTimeout("read timed out") for _ in range(4)])
+            with self.assertRaises(rec.ReconcileError) as caught:
+                rec.AListClient(cfg, session=exhausted).list_all(ROOT)
+            self.assertEqual(caught.exception.code, "alist_request_uncertain")
+            self.assertEqual(len(exhausted.calls), 3)
+
+        cases = (
+            {"code": 401, "message": "authentication failed"},
+            {"code": 200, "data": {"total": 1, "content": "malformed"}},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(tmp)
+                session = self.Session([payload, {"code": 200, "data": {"total": 0, "content": []}}])
+
+                with self.assertRaises(rec.ReconcileError):
+                    rec.AListClient(cfg, session=session).list_all(ROOT)
+
+            self.assertEqual(len(session.calls), 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config(tmp)
+            cfg["alist"].update({"token": "", "username": "user", "password": "pass"})
+            auth_failure = self.Session([(503, {"message": "temporarily unavailable"}),
+                                         {"code": 200, "data": {"total": 0, "content": []}}])
+            with self.assertRaises(rec.ReconcileError):
+                rec.AListClient(cfg, session=auth_failure).list_all(ROOT)
+            self.assertEqual(len(auth_failure.calls), 1)
+
+    def test_http_5xx_is_retried_but_write_failures_are_never_retried(self):
+        success = {"code": 200, "data": {"total": 0, "content": []}}
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config(tmp)
+            session = self.Session([(503, {"message": "upstream unavailable"}), success])
+            rows = rec.AListClient(cfg, session=session).list_all(ROOT)
+            self.assertEqual(rows, [])
+            self.assertEqual(len(session.calls), 2)
+
+        for method_name, args, endpoint in (
+            ("move_file", (ROOT, ROOT, "x.mkv"), "/api/fs/move"),
+            ("rename_file", (ROOT + "/x.mkv", "y.mkv"), "/api/fs/rename"),
+            ("make_dir", (ROOT + "/review",), "/api/fs/mkdir"),
+        ):
+            with self.subTest(method=method_name), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(tmp)
+                session = self.Session([rec.requests.ReadTimeout("read timed out")])
+                client = rec.AListClient(cfg, session=session)
+
+                with self.assertRaises(rec.ReconcileError) as caught:
+                    getattr(client, method_name)(*args)
+
+            self.assertEqual(caught.exception.code, "alist_request_uncertain")
+            self.assertEqual(len(session.calls), 1)
+            self.assertTrue(session.calls[0][0].endswith(endpoint))
 
     def test_list_all_accepts_null_or_missing_content_only_for_explicit_zero_total(self):
         for data in ({"total": 0, "content": None}, {"total": 0}):

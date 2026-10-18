@@ -18,6 +18,8 @@ Bangumi 的 [`ep` 与 `sort`](https://raw.githubusercontent.com/bangumi/api/mast
 
 标记变化引起的作品目录移动、改名会在状态文件的 `subject_sync.journal` 中先记录 pending，再提交一次请求，并按目录 ID 读回确认。每项确认后立即保存位置；中断后先恢复 pending，未知结果不会重发，即使暂时仍看到原目录。无法确认的 pending 需要人工核查，解决前会阻止后续自动写入。展示标题与文件路径分别处理，含 `/` 的 Bangumi 标题保留在 NFO 中，本地索引目录使用已验证的真实云目录名。
 
+整理器读取 AList 目录页时，暂时性网络故障、HTTP 429/5xx 或明确的上游超时最多尝试 3 次，每次沿用 `alist.timeout_seconds`。认证、权限、响应结构及分页一致性错误会停止对应动作；移动、改名和建目录请求仍只提交一次，结果不明时由操作日志和读回核对恢复。
+
 ## 部署前提
 
 - Linux 主机，Python 3.11 或 3.12，systemd（若要使用仓库提供的定时服务）。
