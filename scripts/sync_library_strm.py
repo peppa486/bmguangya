@@ -1215,6 +1215,17 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
         report["freshness"] = validate_inventory(inventory, config, now=now)
         planned, unresolved, conflicts = build_show_plan(inventory, cfg)
         output_files = _target_file_rows(planned, cfg)
+        try:
+            from . import subtitle_sidecars
+        except ImportError:
+            import subtitle_sidecars
+        generated_strm_paths = {
+            target.relative_to(cfg["media_root"]).as_posix()
+            for target, _body, kind in output_files if kind == "strm"
+        }
+        subtitle_plan = subtitle_sidecars.plan_subtitle_sidecars(
+            inventory, planned, cfg, generated_strm_paths=generated_strm_paths,
+        )
         stale_strms = _managed_stale_strm_candidates(cfg, inventory, output_files, now=now)
         excluded_review_groups: dict[str, dict[str, Any]] = {}
         skipped_review_files: set[str] = set()
@@ -1232,6 +1243,21 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
             "show_count": len(planned),
             "planned_strm_count": sum(len(show["episodes"]) for show in planned),
             "planned_nfo_count": sum(1 for show in planned if show["nfo_title"] is not None),
+            "subtitle_sync": {
+                "status": "planned" if subtitle_plan["planned_count"] else "none",
+                "candidate_count": subtitle_plan["candidate_count"],
+                "planned_count": subtitle_plan["planned_count"],
+                "skipped_count": subtitle_plan["skipped_count"],
+                "skipped_by_reason": subtitle_plan["skipped_by_reason"],
+                "created_count": 0,
+                "unchanged_count": 0,
+                "failed_count": 0,
+                "planned": [
+                    {"source_path": row["source_relative_path"],
+                     "target_path": row["target_relative_path"]}
+                    for row in subtitle_plan["actions"]
+                ],
+            },
             "skipped_review_files": len(skipped_review_files),
             "managed_stale_strm_archive_candidate_count": len(stale_strms),
             "managed_stale_strm_archive_candidates": [
@@ -1256,9 +1282,21 @@ def run(config_path: Path, inventory_path: Path, report_path: Path, *, apply: bo
             report["apply_stats"] = apply_plan(planned, cfg, inventory=inventory, now=now)
             # A successful disk write is reported separately from Jellyfin's verified refresh POST.
             report["applied"] = True
+            report["strm_applied"] = True
+            report["subtitle_sync"] = subtitle_sidecars.apply_subtitle_plan(
+                subtitle_plan, config, cfg,
+            )
             report["jellyfin_refresh"] = refresh_jellyfin(cfg)
-        report["status"] = "ok"
-        code = 0
+            if report["subtitle_sync"].get("failed_count", 0):
+                report["status"] = "partial"
+                report["error"] = "subtitle sidecar synchronization incomplete"
+                code = 1
+            else:
+                report["status"] = "ok"
+                code = 0
+        else:
+            report["status"] = "ok"
+            code = 0
     except Exception as exc:
         report["status"] = "error"
         report["error"] = str(exc) if isinstance(exc, SyncError) else "{}: operation failed".format(type(exc).__name__)
@@ -1280,8 +1318,16 @@ def main(argv: list[str] | None = None) -> int:
     summary = {key: report.get(key) for key in (
         "status", "mode", "applied", "show_count", "planned_strm_count", "planned_nfo_count",
         "skipped_review_files", "managed_stale_strm_archive_candidate_count",
-        "excluded_review_paths", "unresolved", "error", "jellyfin_refresh",
+        "excluded_review_paths", "unresolved", "error", "jellyfin_refresh", "strm_applied",
     ) if key in report}
+    subtitle_summary = report.get("subtitle_sync")
+    if isinstance(subtitle_summary, dict):
+        summary["subtitle_sync"] = {
+            key: subtitle_summary.get(key) for key in (
+                "status", "candidate_count", "planned_count", "skipped_count",
+                "created_count", "unchanged_count", "failed_count",
+            ) if key in subtitle_summary
+        }
     print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
     return code
 

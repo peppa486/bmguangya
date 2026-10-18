@@ -35,6 +35,7 @@ VIDEO_SUFFIXES = {
 SUBTITLE_SUFFIXES = {
     ".ass", ".ssa", ".srt", ".sub", ".idx", ".sup", ".vtt", ".smi", ".sami",
 }
+SUBTITLE_LANGUAGE_TAGS = frozenset({"scjp", "tcjp", "sc", "tc", "zh-cn", "chs", "cht"})
 EPISODE_LABEL = re.compile(r"^(?:EP\d{2,3}(?:\.\d+)?|SP\d{2,3}|OVA\d{2,3}|OAD\d{2,3}|NCOP\d{0,3}|NCED\d{0,3})$", re.I)
 
 
@@ -301,6 +302,54 @@ def _normalize_stem(name: str) -> str:
     return unicodedata.normalize("NFKC", PurePosixPath(name).stem).casefold()
 
 
+def _subtitle_language_suffix(name: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Return the normalized base stem and one supported trailing language tag."""
+    stem = _normalize_stem(name)
+    match = re.fullmatch(r"(.+)\.([^.]+)", stem)
+    if not match:
+        return None, None, "no_language_suffix"
+    base, tag = match.groups()
+    if tag not in SUBTITLE_LANGUAGE_TAGS:
+        return None, None, "unknown_language_suffix"
+    previous = base.rsplit(".", 1)[-1]
+    if previous in SUBTITLE_LANGUAGE_TAGS:
+        return None, None, "multiple_language_suffixes"
+    return base, tag, "supported_language_suffix"
+
+
+def _subtitle_video_matches(subtitle: dict, video_nodes: Sequence[dict], *,
+                            video_index: Optional[Dict[str, Dict[str, List[dict]]]] = None
+                            ) -> Tuple[List[dict], str]:
+    """Find same-parent video matches, preferring an exact stem over one tag."""
+    subtitle_path = subtitle.get("_relative_path")
+    if not isinstance(subtitle_path, str) or "/" not in subtitle_path:
+        parent = ""
+    else:
+        parent = subtitle_path.rsplit("/", 1)[0]
+    subtitle_name = str(subtitle.get("name") or "")
+    stem = _normalize_stem(subtitle_name)
+    if video_index is not None:
+        by_stem = video_index.get(parent, {})
+        exact = by_stem.get(stem, [])
+    else:
+        siblings = [node for node in video_nodes
+                    if "/".join(str(node.get("_relative_path") or "").split("/")[:-1]) == parent]
+        exact = [node for node in siblings if _normalize_stem(str(node.get("name") or "")) == stem]
+    if exact:
+        return exact, "exact" if len(exact) == 1 else "ambiguous_exact"
+
+    base_stem, _, suffix_state = _subtitle_language_suffix(subtitle_name)
+    if suffix_state != "supported_language_suffix" or base_stem is None:
+        return [], suffix_state
+    if video_index is not None:
+        localized = by_stem.get(base_stem, [])
+    else:
+        localized = [node for node in siblings
+                     if _normalize_stem(str(node.get("name") or "")) == base_stem]
+    return localized, "language_suffix" if len(localized) == 1 else (
+        "ambiguous_language_suffix" if localized else "unmatched_language_suffix")
+
+
 def _action_id(subject_id: str, episode_key: str, file_id: str, source: str, target: str) -> str:
     raw = "\0".join((subject_id, episode_key, file_id, source, target)).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:24]
@@ -313,7 +362,8 @@ def _inventory_file_evidence(root: dict, relative_path: str, file_id: str, file_
 
 def _build_file_action(category: str, show: dict, episode: dict, evidence: dict,
                        cfg: dict, inventory_root: dict, *, role: str = "video",
-                       associated_episode: Optional[str] = None) -> dict:
+                       associated_episode: Optional[str] = None,
+                       subtitle_language_tag: Optional[str] = None) -> dict:
     subject_id = str(show.get("subject_id") or "")
     show_path = show.get("source_path")
     if not isinstance(show_path, str) or not show_path:
@@ -339,6 +389,8 @@ def _build_file_action(category: str, show: dict, episode: dict, evidence: dict,
     if not episode_key:
         raise ReconcileError("episode has no safe canonical episode key", code="unknown_episode_key")
     target_name = episode_key + suffix
+    if role == "subtitle" and subtitle_language_tag in SUBTITLE_LANGUAGE_TAGS:
+        target_name = episode_key + "." + subtitle_language_tag + suffix
     target_relative = "/".join((*show_parts, target_name))
     source_parent_relative = "/".join(file_parts[:-1])
     if not source_parent_relative:
@@ -433,6 +485,17 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
 
     show_files = [node for node in _walk_files(root)
                   if tuple(node["_relative_path"].split("/")[:len(show_parts)]) == show_parts]
+    show_videos = [node for node in show_files
+                   if PurePosixPath(str(node.get("name") or "")).suffix.lower() in VIDEO_SUFFIXES]
+    show_video_index: Dict[str, Dict[str, List[dict]]] = {}
+    show_subtitles_by_parent: Dict[str, List[dict]] = {}
+    for node in show_videos:
+        parent = str(node.get("_relative_path") or "").rsplit("/", 1)[0]
+        show_video_index.setdefault(parent, {}).setdefault(_normalize_stem(node.get("name") or ""), []).append(node)
+    for node in show_files:
+        if PurePosixPath(str(node.get("name") or "")).suffix.lower() in SUBTITLE_SUFFIXES:
+            parent = str(node.get("_relative_path") or "").rsplit("/", 1)[0]
+            show_subtitles_by_parent.setdefault(parent, []).append(node)
     grouped: Dict[str, List[dict]] = {}
     for episode in episodes:
         if not isinstance(episode, dict) or episode.get("present") is not True or episode.get("is_special") is True:
@@ -603,31 +666,42 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
                 source_parts = _clean_relative_path(video["relative_path"], field="duplicate source")
                 source_parent = "/".join(source_parts[:-1])
                 stem = _normalize_stem(video["name"])
-                same_stem_videos = [node for node in show_files
-                                    if PurePosixPath(node["name"]).suffix.lower() in VIDEO_SUFFIXES
-                                    and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
-                                    and _normalize_stem(node["name"]) == stem]
+                same_stem_videos = show_video_index.get(source_parent, {}).get(stem, [])
                 if len(same_stem_videos) != 1 or same_stem_videos[0]["_relative_path"] != video["relative_path"]:
                     valid = False
                     invalid_reason = "exact-basename subtitle association is ambiguous"
                     break
-                subtitles = [node for node in show_files
-                             if PurePosixPath(node["name"]).suffix.lower() in SUBTITLE_SUFFIXES
-                             and "/".join(node["_relative_path"].split("/")[:-1]) == source_parent
-                             and _normalize_stem(node["name"]) == stem]
+                subtitles = []
+                for subtitle in show_subtitles_by_parent.get(source_parent, []):
+                    matches, match_kind = _subtitle_video_matches(
+                        subtitle, (), video_index=show_video_index)
+                    if (match_kind.startswith("ambiguous")
+                            and any(node.get("_relative_path") == video["relative_path"] for node in matches)):
+                        valid = False
+                        invalid_reason = "subtitle association has multiple same-parent video candidates"
+                        break
+                    if (len(matches) == 1
+                            and matches[0].get("_relative_path") == video["relative_path"]):
+                        language_tag = None
+                        if match_kind == "language_suffix":
+                            _, language_tag, _ = _subtitle_language_suffix(subtitle["name"])
+                        subtitles.append((subtitle, language_tag))
+                if not valid:
+                    break
                 bundle = [{"name": video["name"], "relative_path": video["relative_path"],
                            "file_id": video["file_id"], "role": "video"}]
-                for subtitle in subtitles:
+                for subtitle, language_tag in subtitles:
                     subtitle_id = _file_id(subtitle)
                     subtitle_path = subtitle["_relative_path"]
                     subtitle_node = _node_by_relative_path(root, subtitle_path)
                     if (not subtitle_id or subtitle_node is None or _is_dir(subtitle_node)
                             or _file_id(subtitle_node) != subtitle_id):
                         valid = False
-                        invalid_reason = "an exact-basename subtitle has no stable file identity"
+                        invalid_reason = "a matched subtitle has no stable file identity"
                         break
                     bundle.append({"name": subtitle["name"], "relative_path": subtitle_path,
-                                   "file_id": subtitle_id, "role": "subtitle"})
+                                   "file_id": subtitle_id, "role": "subtitle",
+                                   "language_tag": language_tag})
                 if not valid:
                     break
                 loser_bundles.append({"items": bundle, "kept": kept,
@@ -660,6 +734,12 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
 
         planned_bundle_actions = []
         planned_names = set(used_names)
+
+        def bundle_target_name(stem: str, item: dict) -> str:
+            suffix = PurePosixPath(item["name"]).suffix
+            language = item.get("language_tag") if item.get("role") == "subtitle" else None
+            return stem + ("." + language if language else "") + suffix
+
         for loser in loser_bundles:
             bundle = loser["items"]
             kept = loser["kept"]
@@ -667,15 +747,15 @@ def _build_verified_duplicate_content_actions(inventory: dict, cfg: dict, catego
             extension = PurePosixPath(video["name"]).suffix
             original_stem = video["name"][:-len(extension)]
             candidate_stem = original_stem
-            bundle_names = [candidate_stem + PurePosixPath(item["name"]).suffix for item in bundle]
+            bundle_names = [bundle_target_name(candidate_stem, item) for item in bundle]
             if any(name.casefold() in planned_names for name in bundle_names):
                 stable = hashlib.sha256((video["relative_path"] + "\0" + video["file_id"]).encode("utf-8")).hexdigest()[:8]
                 candidate_stem = original_stem + " [copy-{}]".format(stable)
-                bundle_names = [candidate_stem + PurePosixPath(item["name"]).suffix for item in bundle]
+                bundle_names = [bundle_target_name(candidate_stem, item) for item in bundle]
                 index = 2
                 while any(name.casefold() in planned_names for name in bundle_names):
                     candidate_stem = original_stem + " [copy-{}-{}]".format(stable, index)
-                    bundle_names = [candidate_stem + PurePosixPath(item["name"]).suffix for item in bundle]
+                    bundle_names = [bundle_target_name(candidate_stem, item) for item in bundle]
                     index += 1
                     if index > 1000:
                         valid = False
@@ -1847,6 +1927,17 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
         show_parts = _clean_relative_path(show_path, field="show.source_path")
         show_files = [node for node in all_file_nodes
                       if tuple(node["_relative_path"].split("/")[:len(show_parts)]) == show_parts]
+        show_videos = [node for node in show_files
+                       if PurePosixPath(str(node.get("name") or "")).suffix.lower() in VIDEO_SUFFIXES]
+        show_video_index: Dict[str, Dict[str, List[dict]]] = {}
+        show_subtitles_by_parent: Dict[str, List[dict]] = {}
+        for node in show_videos:
+            parent = str(node.get("_relative_path") or "").rsplit("/", 1)[0]
+            show_video_index.setdefault(parent, {}).setdefault(_normalize_stem(node.get("name") or ""), []).append(node)
+        for node in show_files:
+            if PurePosixPath(str(node.get("name") or "")).suffix.lower() in SUBTITLE_SUFFIXES:
+                parent = str(node.get("_relative_path") or "").rsplit("/", 1)[0]
+                show_subtitles_by_parent.setdefault(parent, []).append(node)
         for item in episodes:
             if not isinstance(item, dict) or item.get("present") is not True:
                 continue
@@ -1894,8 +1985,9 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
             videos_by_key.setdefault(item_key, []).append((item, action))
             actions.append(action)
 
-        # Only exact basename companions are moved. Unpaired subtitle files stay
-        # where they are and are listed for manual review.
+        # Exact basename companions take priority. Only when there is no exact
+        # match may one recognized trailing language tag associate a subtitle
+        # with its unique same-parent video.
         paired_subtitle_paths = {
             action["source_relative_path"] for action in show_duplicate_actions
             if action.get("role") == "duplicate_content_subtitle"
@@ -1906,18 +1998,23 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
             item, video_action = rows[0]
             video_rel = video_action["source_relative_path"]
             video_parent = "/".join(video_rel.split("/")[:-1])
-            exact_stem = _normalize_stem(video_action["original_name"])
-            companions = [node for node in show_files
-                          if PurePosixPath(node["name"]).suffix.lower() in SUBTITLE_SUFFIXES
-                          and "/".join(node["_relative_path"].split("/")[:-1]) == video_parent
-                          and _normalize_stem(node["name"]) == exact_stem]
-            for subtitle in companions:
+            companions = []
+            for node in show_subtitles_by_parent.get(video_parent, []):
+                matches, match_kind = _subtitle_video_matches(
+                    node, (), video_index=show_video_index)
+                if len(matches) == 1 and matches[0].get("_relative_path") == video_rel:
+                    language_tag = None
+                    if match_kind == "language_suffix":
+                        _, language_tag, _ = _subtitle_language_suffix(node["name"])
+                    companions.append((node, language_tag))
+            for subtitle, language_tag in companions:
                 paired_subtitle_paths.add(subtitle["_relative_path"])
                 sub_evidence = {"name": subtitle["name"], "relative_path": subtitle["_relative_path"],
                                 "file_id": _file_id(subtitle)}
                 try:
                     action = _build_file_action(category, show, item, sub_evidence, cfg, root,
-                                               role="subtitle", associated_episode=key)
+                                               role="subtitle", associated_episode=key,
+                                               subtitle_language_tag=language_tag)
                     action["group_id"] = video_action["action_id"]
                     action["requires_verified_video"] = video_action["action_id"]
                     actions.append(action)
@@ -1952,7 +2049,7 @@ def build_plan(inventory: dict, cfg: dict) -> dict:
                 unresolved.append({"subject_id": subject_id, "show_name": show.get("name"),
                                    "relative_path": node["_relative_path"], "file_id": _file_id(node),
                                    "state": "blocked", "code": "unpaired_subtitle",
-                                   "message": "subtitle has no unique exact-basename video companion; left untouched"})
+                                   "message": "subtitle has no unique exact-basename or supported-language video companion; left untouched"})
 
     # Resolve target-name conflicts against the full fresh inventory and against
     # other planned files, including subtitles.

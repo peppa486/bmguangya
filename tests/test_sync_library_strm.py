@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import library_inventory as library_inv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import sync_library_strm as sync
+import subtitle_sidecars
 
 
 NOW = dt.datetime(2026, 10, 17, 12, 0, tzinfo=dt.timezone.utc)
@@ -118,6 +119,18 @@ def inventory(*shows: dict, cloud_files: tuple[str, ...] = ()) -> dict:
             for category in sync.CATEGORIES
         ],
     }
+
+
+def set_inventory_file_identity(inventory_row: dict, relative_path: str, *, file_id: str, size: int) -> None:
+    root = inventory_row["inventory_root"]
+    node = None
+    for part in relative_path.split("/"):
+        node = next(child for child in root["children"] if child["name"] == part) if node is None else next(
+            child for child in node["children"] if child["name"] == part
+        )
+        root = node
+    node["file_id"] = file_id
+    node["size"] = size
 
 
 def bangumi_inventory_show(title: str, subject_id: str, sort_start: int, count: int,
@@ -658,6 +671,79 @@ class SyncLibraryStrmTests(unittest.TestCase):
             self.assertTrue(report_path.is_file())
             self.assertNotIn("do-not-print-me", report_path.read_text(encoding="utf-8"))
             refresh.assert_called_once()
+
+    def test_subtitle_dry_run_reports_paths_without_network_or_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = config(root / "media", root / "archive")
+            inv = inventory(show(), cloud_files=("在看/Foo/Disc 01/01.scjp.ass",))
+            set_inventory_file_identity(inv, "在看/Foo/Disc 01/01.scjp.ass", file_id="subtitle-1", size=7)
+            config_path = root / "config.json"
+            inventory_path = root / "library.json"
+            report_path = root / "report.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            inventory_path.write_text(json.dumps(inv, ensure_ascii=False), encoding="utf-8")
+
+            with patch.object(subtitle_sidecars, "apply_subtitle_plan") as apply_subtitles, \
+                    patch.object(subtitle_sidecars, "_native_parent_listing") as list_parent, \
+                    patch.object(sync, "refresh_jellyfin") as refresh:
+                report, code = sync.run(config_path, inventory_path, report_path, apply=False, now=NOW)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(report["subtitle_sync"]["status"], "planned")
+            self.assertEqual(report["subtitle_sync"]["planned"], [{
+                "source_path": "在看/Foo/Disc 01/01.scjp.ass",
+                "target_path": "在看/Foo/EP01.zh.scjp.ass",
+            }])
+            self.assertFalse((root / "media" / "在看" / "Foo" / "EP01.zh.scjp.ass").exists())
+            apply_subtitles.assert_not_called()
+            list_parent.assert_not_called()
+            refresh.assert_not_called()
+            report_json = report_path.read_text(encoding="utf-8")
+            self.assertNotIn("s3cret", report_json)
+            self.assertNotIn("http://", report_json)
+
+    def test_subtitle_apply_failure_reports_strm_applied_and_partial_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = config(root / "media", root / "archive")
+            inv = inventory(show(), cloud_files=("在看/Foo/Disc 01/01.scjp.ass",))
+            set_inventory_file_identity(inv, "在看/Foo/Disc 01/01.scjp.ass", file_id="subtitle-1", size=7)
+            config_path = root / "config.json"
+            inventory_path = root / "library.json"
+            report_path = root / "report.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            inventory_path.write_text(json.dumps(inv, ensure_ascii=False), encoding="utf-8")
+
+            with patch.object(subtitle_sidecars, "apply_subtitle_plan", return_value={
+                "requested": True,
+                "status": "partial",
+                "candidate_count": 1,
+                "planned_count": 1,
+                "created_count": 0,
+                "unchanged_count": 0,
+                "failed_count": 1,
+                "errors": [{"source_path": "在看/Foo/Disc 01/01.scjp.ass",
+                            "target_path": "在看/Foo/EP01.zh.scjp.ass",
+                            "code": "bounded_download_failed"}],
+                "completed": [],
+                "planned": [{"source_path": "在看/Foo/Disc 01/01.scjp.ass",
+                             "target_path": "在看/Foo/EP01.zh.scjp.ass"}],
+            }) as apply_subtitles, patch.object(sync, "refresh_jellyfin", return_value={
+                "requested": True, "status_code": 204, "verified": True,
+            }):
+                report, code = sync.run(config_path, inventory_path, report_path, apply=True, now=NOW)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(report["status"], "partial")
+            self.assertTrue(report["applied"])
+            self.assertTrue(report["strm_applied"])
+            self.assertEqual(report["subtitle_sync"]["failed_count"], 1)
+            self.assertEqual(report["error"], "subtitle sidecar synchronization incomplete")
+            self.assertTrue((root / "media" / "在看" / "Foo" / "EP01.strm").is_file())
+            self.assertFalse((root / "media" / "在看" / "Foo" / "EP01.zh.scjp.ass").exists())
+            self.assertNotIn("s3cret", report_path.read_text(encoding="utf-8"))
+            apply_subtitles.assert_called_once()
 
     def test_dry_run_lists_and_apply_archives_managed_strm_to_missing_cloud_path(self):
         with tempfile.TemporaryDirectory() as tmp:

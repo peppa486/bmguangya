@@ -421,6 +421,118 @@ class ReconcilePlanTests(unittest.TestCase):
         self.assertEqual(plan["empty_directories"][0]["relative_path"], SHOW_REL + "/Empty")
         self.assertTrue(all(row["action"] == "none" for row in plan["empty_directories"]))
 
+    def test_language_tagged_subtitles_pair_and_keep_distinct_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(nested=False, with_subtitle=False, extra=False)
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            show_node["children"].extend([
+                fnode("01.SCJP.ass", "subtitle-scjp"),
+                fnode("01.ＴＣＪＰ.ass", "subtitle-tcjp"),
+            ])
+            plan = rec.build_plan(inventory, config(tmp))
+
+        subtitles = [row for row in plan["actions"] if row.get("role") == "subtitle"]
+        self.assertEqual({row["target_relative_path"] for row in subtitles}, {
+            SHOW_REL + "/EP01.scjp.ass", SHOW_REL + "/EP01.tcjp.ass",
+        })
+        video = next(row for row in plan["actions"] if row.get("role") == "video")
+        self.assertTrue(all(row["requires_verified_video"] == video["action_id"] for row in subtitles))
+        self.assertNotIn("unpaired_subtitle", {row.get("code") for row in plan["unresolved"]})
+
+    def test_unknown_and_multiple_language_suffixes_stay_unpaired(self):
+        for name in ("01.en.ass", "01.sc.tc.ass"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                inventory = make_inventory(nested=False, with_subtitle=False, extra=False)
+                show_node = inventory["inventory_root"]["children"][0]["children"][0]
+                show_node["children"].append(fnode(name, "subtitle-" + name.replace(".", "-")))
+                plan = rec.build_plan(inventory, config(tmp))
+
+            self.assertFalse(any(row.get("role") == "subtitle" for row in plan["actions"]))
+            self.assertTrue(any(row.get("code") == "unpaired_subtitle"
+                                and row.get("relative_path", "").endswith("/" + name)
+                                for row in plan["unresolved"]))
+
+    def test_strict_stem_match_takes_precedence_over_language_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(nested=False, with_subtitle=False, extra=False)
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            show_node["children"].extend([
+                fnode("01.scjp.mkv", "other-exact-video"),
+                fnode("01.scjp.ass", "subtitle-scjp"),
+            ])
+            plan = rec.build_plan(inventory, config(tmp))
+
+        self.assertFalse(any(row.get("role") == "subtitle" for row in plan["actions"]))
+        self.assertIn("unpaired_subtitle", {row.get("code") for row in plan["unresolved"]})
+
+    def test_strict_stem_pair_does_not_infer_language_from_a_shared_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(nested=False, with_subtitle=False, extra=False)
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            video = next(child for child in show_node["children"] if child["name"] == "01.mkv")
+            video["name"] = "01.scjp.mkv"
+            episode = inventory["tree"][0]["shows"][0]["episodes"][0]
+            episode["file_name"] = "01.scjp.mkv"
+            episode["relative_path"] = SHOW_REL + "/01.scjp.mkv"
+            episode["present_files"][0].update({
+                "name": "01.scjp.mkv", "relative_path": SHOW_REL + "/01.scjp.mkv",
+            })
+            show_node["children"].append(fnode("01.scjp.ass", "subtitle-scjp"))
+            plan = rec.build_plan(inventory, config(tmp))
+
+        subtitle = next(row for row in plan["actions"] if row.get("role") == "subtitle")
+        self.assertEqual(subtitle["target_relative_path"], SHOW_REL + "/EP01.ass")
+
+    def test_ambiguous_same_parent_language_match_stays_unpaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(nested=False, with_subtitle=False, extra=False)
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            show_node["children"].extend([
+                fnode("01.mp4", "second-video"),
+                fnode("01.scjp.ass", "subtitle-scjp"),
+            ])
+            plan = rec.build_plan(inventory, config(tmp))
+
+        self.assertFalse(any(row.get("role") == "subtitle" for row in plan["actions"]))
+        self.assertIn("unpaired_subtitle", {row.get("code") for row in plan["unresolved"]})
+
+    def test_language_tagged_subtitle_target_conflict_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = make_inventory(nested=False, with_subtitle=False, extra=False,
+                                       target="EP01.scjp.ass")
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            show_node["children"].append(fnode("01.scjp.ass", "subtitle-scjp"))
+            plan = rec.build_plan(inventory, config(tmp))
+
+        subtitle = next(row for row in plan["actions"] if row.get("role") == "subtitle")
+        self.assertEqual(subtitle["target_relative_path"], SHOW_REL + "/EP01.scjp.ass")
+        self.assertEqual(subtitle["state"], "blocked")
+        self.assertEqual(subtitle["blocked"]["code"], "target_conflict")
+
+    def test_duplicate_content_pairs_supported_language_subtitles_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = add_verified_duplicate_episode(make_inventory(extra=False))
+            show_node = inventory["inventory_root"]["children"][0]["children"][0]
+            disc = next(child for child in show_node["children"] if child["name"] == "Disc 01")
+            disc["children"] = [child for child in disc["children"] if child["name"] != "01.ass"]
+            disc["children"].extend([
+                fnode("01.scjp.ass", "duplicate-subtitle-scjp"),
+                fnode("01.tcjp.ass", "duplicate-subtitle-tcjp"),
+                fnode("01.en.ass", "unknown-subtitle"),
+            ])
+            cfg = config(tmp)
+            cfg["organize_unassigned"] = True
+            plan = rec.build_plan(inventory, cfg)
+
+        duplicate_subtitles = [row for row in plan["actions"]
+                               if row.get("role") == "duplicate_content_subtitle"]
+        self.assertEqual({row["target_relative_path"] for row in duplicate_subtitles}, {
+            "未标记/待核对-重复内容/Foo/01.scjp.ass",
+            "未标记/待核对-重复内容/Foo/01.tcjp.ass",
+        })
+        self.assertNotIn("unknown-subtitle", {row.get("file_id") for row in plan["actions"]})
+        self.assertIn("unpaired_subtitle", {row.get("code") for row in plan["unresolved"]})
+
     def test_conflicts_and_multiple_file_evidence_are_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = config(tmp)
